@@ -97,16 +97,5 @@ To address slow convergence, we employ acceleration techniques:
 ## Key Insight
 For $K = 1$, the problem is not algorithmic sophistication, but minimizing cost per iteration and improving convergence rate. Power iteration achieves minimal per-iteration cost, maximum GPU efficiency, and optimal memory usage.
 
-## Final Recommendation
-For large-scale eigenvector centrality computation ($K = 1$):
-* **YES**: Use Power Iteration with CSR + SpMV (optionally accelerated)
-* **NO**: Avoid Lanczos and block methods
-
-## Implementation Stack
-* **Matrix format**: CSR (Compressed Sparse Row)
-* **SpMV**: cuSPARSE
-* **Vector operations**: cuBLAS
-* **Optional optimization**: Merge Path for load balancing
-
 ## Conclusion
 While Lanczos is a powerful method for computing multiple eigenpairs, it does not provide advantages for single eigenvector computation. Power iteration remains the most efficient, scalable, and practical approach for eigenvector centrality in large graphs.
