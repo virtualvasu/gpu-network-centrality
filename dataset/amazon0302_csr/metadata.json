@@ -1,0 +1,8 @@
+{
+  "num_nodes": 262111,
+  "num_edges": 1234877,
+  "indptr_length": 262112,
+  "indices_length": 1234877,
+  "data_length": 1234877,
+  "input_file": "dataset/amazon0302.txt/Amazon0302.txt"
+}
