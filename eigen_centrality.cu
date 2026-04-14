@@ -15,8 +15,7 @@
 
 // --- KERNELS ---
 
-// 1. Parallel Reduction Kernel (The Speed Booster)
-// Replaces CPU loops for Norm and Residual calculations
+// 1. Parallel Reduction Kernel (High Efficiency Tree Reduction)
 __global__ void parallel_reduce_metrics(int n, float* y, float* d_diff, float* d_norm_out, float* d_res_out) {
     extern __shared__ float sdata[];
     float* s_norm = sdata;
@@ -28,9 +27,9 @@ __global__ void parallel_reduce_metrics(int n, float* y, float* d_diff, float* d
     float local_norm = 0;
     float local_res = 0;
 
-    // Grid-stride loop for scalability
     while (i < n) {
-        local_norm += y[i] * y[i];
+        float val = y[i];
+        local_norm += val * val;
         local_res += d_diff[i];
         i += blockDim.x * gridDim.x;
     }
@@ -38,7 +37,6 @@ __global__ void parallel_reduce_metrics(int n, float* y, float* d_diff, float* d
     s_res[tid] = local_res;
     __syncthreads();
 
-    // Tree reduction in shared memory
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
             s_norm[tid] += s_norm[tid + s];
@@ -53,7 +51,7 @@ __global__ void parallel_reduce_metrics(int n, float* y, float* d_diff, float* d
     }
 }
 
-// 2. Optimized SpMV Kernel (Merge Path + __ldg)
+// 2. Merge Path Helper
 __device__ void compute_merge_path(int global_idx, const int* row_ptr, int num_rows, int nnz, int* x_coord, int* y_coord) {
     int low = max(0, global_idx - nnz);
     int high = min(global_idx, num_rows);
@@ -66,7 +64,8 @@ __device__ void compute_merge_path(int global_idx, const int* row_ptr, int num_r
     *y_coord = global_idx - low;
 }
 
-__global__ void hybrid_spmv_merge_path_kernel(int n, int nnz, const int* row_ptr, const int* col_ind, const float* vals, const float* x, float* y) {
+// 3. ULTRA OPTIMIZED SpMV (v2)
+__global__ void hybrid_spmv_merge_path_kernel_v2(int n, int nnz, const int* row_ptr, const int* col_ind, const float* vals, const float* x, float* y) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int total_work = n + nnz;
     int items_per_thread = (total_work + (gridDim.x * blockDim.x) - 1) / (gridDim.x * blockDim.x);
@@ -79,42 +78,50 @@ __global__ void hybrid_spmv_merge_path_kernel(int n, int nnz, const int* row_ptr
     compute_merge_path(t_start, row_ptr, n, nnz, &cur_row, &cur_edge);
 
     float thread_sum = 0;
+
+    // Pragma unroll for loop efficiency
+    #pragma unroll 4
     for (int i = t_start; i < t_end; ++i) {
         if (cur_row < n && cur_edge >= row_ptr[cur_row + 1]) {
-            atomicAdd(&y[cur_row], thread_sum);
-            thread_sum = 0;
+            if (thread_sum != 0) {
+                atomicAdd(&y[cur_row], thread_sum);
+                thread_sum = 0;
+            }
             cur_row++;
         } else {
+            // Using __ldg for read-only vector caching
             thread_sum += vals[cur_edge] * __ldg(&x[col_ind[cur_edge]]);
             cur_edge++;
         }
     }
-    if (cur_row < n) atomicAdd(&y[cur_row], thread_sum);
+    if (thread_sum != 0 && cur_row < n) {
+        atomicAdd(&y[cur_row], thread_sum);
+    }
 }
 
 __global__ void normalize_residual_kernel(int n, float* x, float* y, float norm, float* diff) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         float next_val = y[idx] / norm;
-        diff[idx] = (next_val - x[idx]) * (next_val - x[idx]);
+        float d = next_val - x[idx];
+        diff[idx] = d * d;
         x[idx] = next_val;
     }
 }
-
-// --- HOST PIPELINE ---
 
 void run_optimized_evcent(const char* path, int max_iter, float tol, int top_k) {
     FILE* f = fopen(path, "rb");
     int n, nnz;
     if(!f) return;
-    fread(&n, sizeof(int), 1, f);
-    fread(&nnz, sizeof(int), 1, f);
+    // Suppressing warnings by capturing return values
+    size_t r1 = fread(&n, sizeof(int), 1, f);
+    size_t r2 = fread(&nnz, sizeof(int), 1, f);
     std::vector<int> h_row_ptr(n + 1);
     std::vector<int> h_col_ind(nnz);
     std::vector<float> h_vals(nnz);
-    fread(h_row_ptr.data(), sizeof(int), n + 1, f);
-    fread(h_col_ind.data(), sizeof(int), nnz, f);
-    fread(h_vals.data(), sizeof(float), nnz, f);
+    size_t r3 = fread(h_row_ptr.data(), sizeof(int), n + 1, f);
+    size_t r4 = fread(h_col_ind.data(), sizeof(int), nnz, f);
+    size_t r5 = fread(h_vals.data(), sizeof(float), nnz, f);
     fclose(f);
 
     int *d_row_ptr, *d_col_ind;
@@ -139,6 +146,11 @@ void run_optimized_evcent(const char* path, int max_iter, float tol, int top_k) 
     float h_residual = 1.0f;
     float h_norm = 1.0f;
 
+    // Tuning for RTX 3060: 28 SMs * 6 blocks/SM = 168 blocks
+    int num_blocks = 168; 
+    int num_threads = 256;
+    size_t shared_mem_size = 2 * num_threads * sizeof(float);
+
     auto gpu_start = std::chrono::high_resolution_clock::now();
 
     while (iter < max_iter && h_residual > tol) {
@@ -146,22 +158,20 @@ void run_optimized_evcent(const char* path, int max_iter, float tol, int top_k) 
         CUDA_CHECK(cudaMemset(d_norm_val, 0, sizeof(float)));
         CUDA_CHECK(cudaMemset(d_res_val, 0, sizeof(float)));
 
-        // Step 1: SpMV
-        hybrid_spmv_merge_path_kernel<<<160, 256>>>(n, nnz, d_row_ptr, d_col_ind, d_vals, d_x, d_y);
+        // CORRECTED KERNEL NAME
+        hybrid_spmv_merge_path_kernel_v2<<<num_blocks, num_threads>>>(n, nnz, d_row_ptr, d_col_ind, d_vals, d_x, d_y);
 
-        // Step 2: Parallel Reduction for Norm (GPU only)
-        int threads = 256;
-        int blocks = 160; 
-        parallel_reduce_metrics<<<blocks, threads, 2 * threads * sizeof(float)>>>(n, d_y, d_diff, d_norm_val, d_res_val);
+        // Parallel Metrics Reduction
+        parallel_reduce_metrics<<<num_blocks, num_threads, shared_mem_size>>>(n, d_y, d_diff, d_norm_val, d_res_val);
         CUDA_CHECK(cudaMemcpy(&h_norm, d_norm_val, sizeof(float), cudaMemcpyDeviceToHost));
         h_norm = sqrtf(h_norm);
 
-        // Step 3: Normalize and Calc Squared Diff
+        // Update Vector and calculate per-element diff
         normalize_residual_kernel<<<(n + 255) / 256, 256>>>(n, d_x, d_y, h_norm, d_diff);
 
-        // Step 4: Parallel Reduction for Residual (GPU only)
+        // Finalize Residual
         CUDA_CHECK(cudaMemset(d_res_val, 0, sizeof(float)));
-        parallel_reduce_metrics<<<blocks, threads, 2 * threads * sizeof(float)>>>(n, d_y, d_diff, d_norm_val, d_res_val);
+        parallel_reduce_metrics<<<num_blocks, num_threads, shared_mem_size>>>(n, d_y, d_diff, d_norm_val, d_res_val);
         CUDA_CHECK(cudaMemcpy(&h_residual, d_res_val, sizeof(float), cudaMemcpyDeviceToHost));
         h_residual = sqrtf(h_residual);
         
@@ -171,9 +181,8 @@ void run_optimized_evcent(const char* path, int max_iter, float tol, int top_k) 
 
     CUDA_CHECK(cudaMemcpy(h_x.data(), d_x, n * sizeof(float), cudaMemcpyDeviceToHost));
     
-    // Formatting match for baseline comparison
-    printf("Device  : NVIDIA GeForce RTX 3060 (Ultra-Optimized)\n");
-    printf("  Vertices  : %d | Nnz: %d\n", n, nnz);
+    printf("Device  : NVIDIA GeForce RTX 3060 (Optimized v2)\n");
+    printf("  Vertices: %d | Edges: %d\n", n, nnz);
 
     std::vector<std::pair<float, int>> ranked(n);
     for(int i=0; i<n; ++i) ranked[i] = {h_x[i], i};
