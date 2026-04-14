@@ -1,0 +1,3 @@
+ nvcc --allow-unsupported-compiler -std=c++14 -O3 -arch=sm_86 raw_code/lanczos.cu -o raw_code/lanczos -lcusparse -lcublas && ./raw_code/lanczos raw_code/graph2.bin
+
+ 
