@@ -1,3 +1,7 @@
+//            Run it with
+//           nvcc -O3 -arch=sm_86 eigen_centrality.cu -o eigen
+//           ./eigen amazon.bin
+
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -11,14 +15,45 @@
 
 // --- KERNELS ---
 
-// Optimization: Warp Aggregation using Shuffle
-__inline__ __device__ float warp_reduce_sum(float val) {
-    for (int offset = 16; offset > 0; offset /= 2)
-        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
-    return val;
+// 1. Parallel Reduction Kernel (The Speed Booster)
+// Replaces CPU loops for Norm and Residual calculations
+__global__ void parallel_reduce_metrics(int n, float* y, float* d_diff, float* d_norm_out, float* d_res_out) {
+    extern __shared__ float sdata[];
+    float* s_norm = sdata;
+    float* s_res = &sdata[blockDim.x];
+
+    unsigned int tid = threadIdx.x;
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    float local_norm = 0;
+    float local_res = 0;
+
+    // Grid-stride loop for scalability
+    while (i < n) {
+        local_norm += y[i] * y[i];
+        local_res += d_diff[i];
+        i += blockDim.x * gridDim.x;
+    }
+    s_norm[tid] = local_norm;
+    s_res[tid] = local_res;
+    __syncthreads();
+
+    // Tree reduction in shared memory
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_norm[tid] += s_norm[tid + s];
+            s_res[tid] += s_res[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        atomicAdd(d_norm_out, s_norm[0]);
+        atomicAdd(d_res_out, s_res[0]);
+    }
 }
 
-// 1. Merge Path Binary Search
+// 2. Optimized SpMV Kernel (Merge Path + __ldg)
 __device__ void compute_merge_path(int global_idx, const int* row_ptr, int num_rows, int nnz, int* x_coord, int* y_coord) {
     int low = max(0, global_idx - nnz);
     int high = min(global_idx, num_rows);
@@ -31,7 +66,6 @@ __device__ void compute_merge_path(int global_idx, const int* row_ptr, int num_r
     *y_coord = global_idx - low;
 }
 
-// 2. Optimized SpMV Kernel (Merge Path + Warp Aggregation + Ldg) .
 __global__ void hybrid_spmv_merge_path_kernel(int n, int nnz, const int* row_ptr, const int* col_ind, const float* vals, const float* x, float* y) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int total_work = n + nnz;
@@ -51,7 +85,6 @@ __global__ void hybrid_spmv_merge_path_kernel(int n, int nnz, const int* row_ptr
             thread_sum = 0;
             cur_row++;
         } else {
-            // Memory Optimization: __ldg caching
             thread_sum += vals[cur_edge] * __ldg(&x[col_ind[cur_edge]]);
             cur_edge++;
         }
@@ -59,7 +92,6 @@ __global__ void hybrid_spmv_merge_path_kernel(int n, int nnz, const int* row_ptr
     if (cur_row < n) atomicAdd(&y[cur_row], thread_sum);
 }
 
-// 3. Normalization and Residual Kernel
 __global__ void normalize_residual_kernel(int n, float* x, float* y, float norm, float* diff) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
@@ -72,9 +104,9 @@ __global__ void normalize_residual_kernel(int n, float* x, float* y, float norm,
 // --- HOST PIPELINE ---
 
 void run_optimized_evcent(const char* path, int max_iter, float tol, int top_k) {
-    // Load Data
     FILE* f = fopen(path, "rb");
     int n, nnz;
+    if(!f) return;
     fread(&n, sizeof(int), 1, f);
     fread(&nnz, sizeof(int), 1, f);
     std::vector<int> h_row_ptr(n + 1);
@@ -85,80 +117,77 @@ void run_optimized_evcent(const char* path, int max_iter, float tol, int top_k) 
     fread(h_vals.data(), sizeof(float), nnz, f);
     fclose(f);
 
-    // Device Allocation
     int *d_row_ptr, *d_col_ind;
-    float *d_vals, *d_x, *d_y, *d_diff;
+    float *d_vals, *d_x, *d_y, *d_diff, *d_norm_val, *d_res_val;
     CUDA_CHECK(cudaMalloc(&d_row_ptr, (n + 1) * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_col_ind, nnz * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_vals, nnz * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_x, n * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_y, n * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_diff, n * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_norm_val, sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_res_val, sizeof(float)));
 
-    auto h2d_start = std::chrono::high_resolution_clock::now();
     CUDA_CHECK(cudaMemcpy(d_row_ptr, h_row_ptr.data(), (n + 1) * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_col_ind, h_col_ind.data(), nnz * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_vals, h_vals.data(), nnz * sizeof(float), cudaMemcpyHostToDevice));
-    auto h2d_end = std::chrono::high_resolution_clock::now();
 
     std::vector<float> h_x(n, 1.0f / sqrtf((float)n));
     CUDA_CHECK(cudaMemcpy(d_x, h_x.data(), n * sizeof(float), cudaMemcpyHostToDevice));
 
     int iter = 0;
-    float residual = 1.0f;
+    float h_residual = 1.0f;
+    float h_norm = 1.0f;
+
     auto gpu_start = std::chrono::high_resolution_clock::now();
 
-    while (iter < max_iter && residual > tol) {
+    while (iter < max_iter && h_residual > tol) {
         CUDA_CHECK(cudaMemset(d_y, 0, n * sizeof(float)));
-        
-        // Launch Hybrid SpMV (Optimized with Merge Path)
+        CUDA_CHECK(cudaMemset(d_norm_val, 0, sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_res_val, 0, sizeof(float)));
+
+        // Step 1: SpMV
         hybrid_spmv_merge_path_kernel<<<160, 256>>>(n, nnz, d_row_ptr, d_col_ind, d_vals, d_x, d_y);
 
-        // Normalize (Using simple reduction for residual)
-        CUDA_CHECK(cudaMemcpy(h_x.data(), d_y, n * sizeof(float), cudaMemcpyDeviceToHost));
-        float norm = 0;
-        for (float v : h_x) norm += v * v;
-        norm = sqrtf(norm);
+        // Step 2: Parallel Reduction for Norm (GPU only)
+        int threads = 256;
+        int blocks = 160; 
+        parallel_reduce_metrics<<<blocks, threads, 2 * threads * sizeof(float)>>>(n, d_y, d_diff, d_norm_val, d_res_val);
+        CUDA_CHECK(cudaMemcpy(&h_norm, d_norm_val, sizeof(float), cudaMemcpyDeviceToHost));
+        h_norm = sqrtf(h_norm);
 
-        normalize_residual_kernel<<<(n + 255) / 256, 256>>>(n, d_x, d_y, norm, d_diff);
+        // Step 3: Normalize and Calc Squared Diff
+        normalize_residual_kernel<<<(n + 255) / 256, 256>>>(n, d_x, d_y, h_norm, d_diff);
+
+        // Step 4: Parallel Reduction for Residual (GPU only)
+        CUDA_CHECK(cudaMemset(d_res_val, 0, sizeof(float)));
+        parallel_reduce_metrics<<<blocks, threads, 2 * threads * sizeof(float)>>>(n, d_y, d_diff, d_norm_val, d_res_val);
+        CUDA_CHECK(cudaMemcpy(&h_residual, d_res_val, sizeof(float), cudaMemcpyDeviceToHost));
+        h_residual = sqrtf(h_residual);
         
-        // Calculate Residual
-        std::vector<float> h_diff(n);
-        CUDA_CHECK(cudaMemcpy(h_diff.data(), d_diff, n * sizeof(float), cudaMemcpyDeviceToHost));
-        residual = 0;
-        for (float d : h_diff) residual += d;
-        residual = sqrtf(residual);
         iter++;
     }
     auto gpu_end = std::chrono::high_resolution_clock::now();
 
-    // Final transfer and format output
     CUDA_CHECK(cudaMemcpy(h_x.data(), d_x, n * sizeof(float), cudaMemcpyDeviceToHost));
     
-    // --- OUTPUT FORMATTING ---
-    printf("Device  : NVIDIA GeForce RTX 3060 (Optimized Solver)\n");
-    printf("Loading %s ...\n", path);
-    printf("  Vertices  : %d\n", n);
-    printf("  Nnz (CSR) : %d\n\n", nnz);
+    // Formatting match for baseline comparison
+    printf("Device  : NVIDIA GeForce RTX 3060 (Ultra-Optimized)\n");
+    printf("  Vertices  : %d | Nnz: %d\n", n, nnz);
 
     std::vector<std::pair<float, int>> ranked(n);
     for(int i=0; i<n; ++i) ranked[i] = {h_x[i], i};
     std::sort(ranked.rbegin(), ranked.rend());
 
-    printf("=== Top-%d Nodes by Eigenvector Centrality ===\n", top_k);
-    printf("  %-6s  %-10s  %s\n", "Rank", "Node ID", "Score");
-    printf("  %-6s  %-10s  %s\n", "----", "-------", "----------");
-    for (int r = 0; r < top_k; ++r)
-        printf("  %-6d  %-10d  %.8f\n", r + 1, ranked[r].second, ranked[r].first);
+    printf("=== Top-20 Nodes ===\n");
+    for (int r = 0; r < 20; ++r)
+        printf("  %d. Node %d: %.8f\n", r + 1, ranked[r].second, ranked[r].first);
 
     double total_ms = std::chrono::duration<double, std::milli>(gpu_end - gpu_start).count();
     printf("\n=== Performance Metrics ===\n");
-    printf("  %-32s : %8.2f ms\n", "H2D transfer", std::chrono::duration<double, std::milli>(h2d_end - h2d_start).count());
-    printf("  %-32s : %8.2f ms\n", "Total GPU time", total_ms);
-    printf("  %-32s : %8d\n", "Iterations", iter);
-    printf("  %-32s : %8.4f ms\n", "Avg time / iteration", total_ms / iter);
-    printf("  %-32s : %.3e\n", "Final residual", residual);
-    printf("  %-32s : %8.2f MB\n", "CSR GPU memory", (double)((n+1+nnz)*4 + nnz*4)/1e6);
+    printf("  Total GPU time : %.2f ms\n", total_ms);
+    printf("  Avg/iteration  : %.4f ms\n", total_ms / iter);
+    printf("  Final residual : %.3e\n", h_residual);
 }
 
 int main(int argc, char** argv) {
