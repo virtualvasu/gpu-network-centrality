@@ -31,7 +31,7 @@ __device__ void compute_merge_path(int global_idx, const int* row_ptr, int num_r
     *y_coord = global_idx - low;
 }
 
-// 2. Optimized SpMV Kernel (Merge Path + Warp Aggregation + Ldg)
+// 2. Optimized SpMV Kernel (Merge Path + Warp Aggregation + Ldg) .
 __global__ void hybrid_spmv_merge_path_kernel(int n, int nnz, const int* row_ptr, const int* col_ind, const float* vals, const float* x, float* y) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int total_work = n + nnz;
