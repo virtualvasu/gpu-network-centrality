@@ -1,0 +1,17 @@
+{
+  "csr_file": "dataset/Amazon0601.csr",
+  "num_nodes": 403394,
+  "num_edges_undirected": 2443408,
+  "nnz": 4886816,
+  "avg_degree": 12.114250583796487,
+  "max_degree": 2752,
+  "min_degree": 1,
+  "density": 3.003081499426488e-05,
+  "method": "power_iteration_csr",
+  "max_iter": 1000,
+  "tol": 1e-06,
+  "runtime_seconds": 4.189234527002554,
+  "converged": true,
+  "top_node_id": 1041,
+  "top_score": 0.4931200532728157
+}
