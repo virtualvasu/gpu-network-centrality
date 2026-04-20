@@ -1,56 +1,28 @@
-# Eigen Centrality Project — Big Picture
+# Eigen Centrality Workflow
 
-## Step 0 — CPU Baseline with NetworkX (Python)
+This repository processes each dataset in the same order so CPU and GPU results stay comparable.
 
-### Objective
-Establish a **reference baseline** for eigenvector centrality using NetworkX on the first dataset before moving to optimized/GPU implementations.
+## Dataset Processing Steps
 
-### Dataset (Step 0 Input)
-- File: `dataset/amazon0302.txt/Amazon0302.txt`
-- Graph type (from file header): **Directed graph**
-- Nodes: **262111**
-- Edges: **1234877**
-- Edge format: `FromNodeId ToNodeId` (integer node IDs)
+1. Get the dataset text file in `.txt` format. The graph may be directed or undirected, depending on the source dataset.
+2. Convert the `.txt` file to CSR format for CPU evaluation.
+3. Run the CPU baseline notebook:
+   `/home/netweb/vasu/ugq/gpu-network-centrality/step0_networkx_eigen_baseline.ipynb`
+4. Convert the graph to `csr.bin` using:
+   `gpu-network-centrality/txt_to_csr.py`
+5. Run the GPU evaluation using:
+   `gpu-network-centrality/raw_code/mergepath.cu`
+6. Save the eigenvector scores and run metrics for each dataset as CSV and JSON files.
 
-### Baseline Definition
-- Library: `networkx`
-- Graph object: `nx.DiGraph`
-- Centrality method: `nx.eigenvector_centrality`
-- Solver style: Power iteration
-- Fixed baseline params:
-	- `max_iter = 1000`
-	- `tol = 1e-06`
-	- `weight = None` (treat all edges as unweighted)
+## Output Files
 
-### Execution Spec
-1. Load graph from `Amazon0302.txt` while ignoring comment lines starting with `#`.
-2. Build a directed graph (`DiGraph`) from the edge list.
-3. Run `nx.eigenvector_centrality(G, max_iter=1000, tol=1e-06, weight=None)`.
-4. Record runtime (wall-clock) for centrality computation.
-5. Save full centrality scores as `(node_id, score)`.
-6. Save Top-20 nodes by score (descending).
+For each dataset, keep:
 
-### Deliverables for Step 0
-- `baseline/networkx/amazon0302_eigenvector_scores.csv`
-	- Columns: `node_id,score`
-- `baseline/networkx/amazon0302_top20.csv`
-	- Columns: `rank,node_id,score`
-- `baseline/networkx/step0_metrics.json`
-	- Fields:
-		- `dataset`
-		- `num_nodes`
-		- `num_edges`
-		- `method`
-		- `max_iter`
-		- `tol`
-		- `runtime_seconds`
-		- `converged` (true/false)
+- eigenvector scores in a CSV file
+- summary metrics in a JSON file
+- any top-k or ranking output used for comparison
 
-### Success Criteria
-- Baseline completes and produces all three output files.
-- Centrality scores are reproducible with the same parameters.
-- This baseline is treated as the **reference** for accuracy and performance comparison in later steps.
+## Notes
 
----
-
-_Future steps (Step 1, Step 2, ...) will be appended below this section._
+- Use the same dataset name across the text file, CSR files, and output files.
+- Keep CPU and GPU runs aligned on the same graph input so the results are comparable.
