@@ -11,11 +11,13 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 from time import perf_counter
-from typing import Dict, Iterable, Tuple
+from typing import Dict
 import json
 import shutil
+import struct
 
 import networkx as nx
 import numpy as np
@@ -26,125 +28,63 @@ from scipy.sparse import csr_matrix
 # =============================================================================
 # CONFIGURATION: dataset-specific baseline run
 # =============================================================================
-DATASET_KEY = "Amazon0601"
-RAW_DATA_PATH = Path(f"dataset/{DATASET_KEY}.txt")
-CSR_DIR = Path(f"dataset/{DATASET_KEY}_csr")
-METADATA_PATH = CSR_DIR / "metadata.json"
-INDPTR_PATH = CSR_DIR / "indptr.txt"
-INDICES_PATH = CSR_DIR / "indices.txt"
-DATA_PATH = CSR_DIR / "data.txt"
+DEFAULT_DATASET_KEY = "roadNet-CA"
 
-OUTPUT_DIR = Path(f"baseline/networkx/{DATASET_KEY}")
-OUTPUT_PREFIX = DATASET_KEY
+def build_paths(dataset_key: str):
+    csr_dir = Path(f"dataset/{dataset_key}_csr")
+    csr_bin_path = csr_dir / f"{dataset_key}.csr"
+    output_dir = Path(f"baseline/networkx/{dataset_key}")
+    output_prefix = dataset_key
+    return csr_dir, csr_bin_path, output_dir, output_prefix
 
 MAX_ITER = 1000
 TOL = 1e-6
 TOP_K = 20
 
 
-def parse_edge_list(path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
-    """Parse SNAP edge-list text file into undirected CSR arrays."""
-    edges = set()
-    nodes = set()
+def load_binary_csr(path: Path):
+    """Load binary CSR file written by txt_to_csr.py (.csr or .csr.bin)."""
+    with path.open("rb") as f:
+        header = f.read(8)
+        if len(header) != 8:
+            raise RuntimeError(f"Invalid CSR file header: {path}")
 
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
+        num_nodes, nnz = struct.unpack("<ii", header)
+        indptr = np.fromfile(f, dtype=np.int32, count=num_nodes + 1).astype(np.int64)
+        indices = np.fromfile(f, dtype=np.int32, count=nnz).astype(np.int64)
+        data = np.fromfile(f, dtype=np.float32, count=nnz).astype(np.float64)
 
-            parts = line.split()
-            if len(parts) < 2:
-                continue
+    if indptr.size != num_nodes + 1 or indices.size != nnz or data.size != nnz:
+        raise RuntimeError(
+            f"Incomplete CSR binary content in {path}. "
+            f"Expected nodes={num_nodes}, nnz={nnz}."
+        )
 
-            u = int(parts[0])
-            v = int(parts[1])
-            if u == v:
-                continue
-
-            # Symmetrize and deduplicate for an undirected graph.
-            edges.add((u, v))
-            edges.add((v, u))
-            nodes.add(u)
-            nodes.add(v)
-
-    node_list = sorted(nodes)
-    node_to_idx = {node: i for i, node in enumerate(node_list)}
-    n = len(node_list)
-
-    adjacency = [[] for _ in range(n)]
-    for u, v in edges:
-        adjacency[node_to_idx[u]].append(node_to_idx[v])
-
-    for neighbors in adjacency:
-        neighbors.sort()
-
-    indptr = np.zeros(n + 1, dtype=np.int64)
-    indices_list = []
-    for i, neighbors in enumerate(adjacency):
-        indptr[i + 1] = indptr[i] + len(neighbors)
-        indices_list.extend(neighbors)
-
-    indices = np.asarray(indices_list, dtype=np.int64)
-    data = np.ones(indices.shape[0], dtype=np.float64)
-
-    undirected_edges = len(indices_list) // 2
-    return indptr, indices, data, n, undirected_edges
-
-
-def write_array(path: Path, values: Iterable) -> None:
-    """Write a 1D array to text file, one value per line."""
-    arr = np.asarray(list(values))
-    np.savetxt(path, arr, fmt="%.18g")
+    num_edges = nnz // 2
+    return indptr, indices, data, num_nodes, num_edges
 
 
 def main() -> None:
-    # Remove only current dataset artifacts for a clean rerun
-    assert RAW_DATA_PATH.exists(), f"Missing raw dataset file: {RAW_DATA_PATH}"
+    parser = argparse.ArgumentParser(description="Run NetworkX eigenvector baseline from existing binary CSR.")
+    parser.add_argument(
+        "--dataset-key",
+        default=DEFAULT_DATASET_KEY,
+        help="Dataset key used for paths: dataset/<key>_csr/<key>.csr",
+    )
+    args = parser.parse_args()
 
-    if CSR_DIR.exists():
-        shutil.rmtree(CSR_DIR)
-    if OUTPUT_DIR.exists():
-        shutil.rmtree(OUTPUT_DIR)
+    dataset_key = args.dataset_key
+    csr_dir, csr_bin_path, output_dir, output_prefix = build_paths(dataset_key)
 
-    # Convert the raw edge list to CSR
-    indptr, indices, data, num_nodes, num_edges = parse_edge_list(RAW_DATA_PATH)
-    CSR_DIR.mkdir(parents=True, exist_ok=True)
-    write_array(INDPTR_PATH, indptr)
-    write_array(INDICES_PATH, indices)
-    write_array(DATA_PATH, data)
+    # Keep existing CSR input untouched; clean only output artifacts.
+    assert csr_bin_path.exists(), f"Missing CSR binary file: {csr_bin_path}"
 
-    metadata: Dict[str, object] = {
-        "num_nodes": int(num_nodes),
-        "num_edges": int(num_edges),
-        "indptr_length": int(len(indptr)),
-        "indices_length": int(len(indices)),
-        "data_length": int(len(data)),
-        "input_file": str(RAW_DATA_PATH),
-    }
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
 
-    with METADATA_PATH.open("w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2)
-        f.write("\n")
-
-    print(f"CSR conversion complete: {CSR_DIR}")
+    indptr, indices, data, num_nodes, num_edges = load_binary_csr(csr_bin_path)
+    print(f"Loaded existing CSR binary: {csr_bin_path}")
     print(f"Nodes={num_nodes}, edges={num_edges}, nnz={len(data)}")
-
-    assert CSR_DIR.exists(), f"Missing CSR directory: {CSR_DIR}"
-    assert METADATA_PATH.exists(), f"Missing metadata file: {METADATA_PATH}"
-    assert INDPTR_PATH.exists(), f"Missing indptr file: {INDPTR_PATH}"
-    assert INDICES_PATH.exists(), f"Missing indices file: {INDICES_PATH}"
-    assert DATA_PATH.exists(), f"Missing data file: {DATA_PATH}"
-
-    with METADATA_PATH.open("r", encoding="utf-8") as f:
-        metadata = json.load(f)
-
-    num_nodes = int(metadata["num_nodes"])
-    num_edges = int(metadata["num_edges"])
-
-    indptr = np.loadtxt(INDPTR_PATH, dtype=np.int64)
-    indices = np.loadtxt(INDICES_PATH, dtype=np.int64)
-    data = np.loadtxt(DATA_PATH, dtype=np.float64)
 
     A = csr_matrix((data, indices, indptr), shape=(num_nodes, num_nodes))
     G = nx.from_scipy_sparse_array(A, create_using=nx.Graph)
@@ -192,18 +132,18 @@ def main() -> None:
     topk_df = scores_df.head(TOP_K).copy()
     topk_df.insert(0, "rank", range(1, len(topk_df) + 1))
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    scores_path = OUTPUT_DIR / f"{OUTPUT_PREFIX}_eigenvector_scores.csv"
-    topk_path = OUTPUT_DIR / f"{OUTPUT_PREFIX}_top{TOP_K}.csv"
-    metrics_path = OUTPUT_DIR / "step0_metrics.json"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    scores_path = output_dir / f"{output_prefix}_eigenvector_scores.csv"
+    topk_path = output_dir / f"{output_prefix}_top{TOP_K}.csv"
+    metrics_path = output_dir / "step0_metrics.json"
 
     scores_df.to_csv(scores_path, index=False)
     topk_df.to_csv(topk_path, index=False)
 
     metrics = {
-        "dataset_key": DATASET_KEY,
-        "dataset": str(RAW_DATA_PATH),
-        "csr_dir": str(CSR_DIR),
+        "dataset_key": dataset_key,
+        "dataset": str(csr_bin_path),
+        "csr_dir": str(csr_dir),
         "num_nodes": int(num_nodes),
         "num_edges": int(num_edges),
         "nnz": int(A.nnz),

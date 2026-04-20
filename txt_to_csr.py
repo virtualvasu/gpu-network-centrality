@@ -122,6 +122,22 @@ def ensure_suffix(path: str, suffix: str) -> str:
     return f"{path}{suffix}"
 
 
+def resolve_output_paths(out_path: str):
+    """Return output paths for both .csr and .csr.bin artifacts."""
+    if out_path.endswith(".csr.bin"):
+        return out_path[:-4], out_path
+    if out_path.endswith(".csr"):
+        return out_path, f"{out_path}.bin"
+    if out_path.endswith(".bin"):
+        csr_path = out_path[:-4]
+        if not csr_path.endswith(".csr"):
+            csr_path = ensure_suffix(csr_path, ".csr")
+        return csr_path, out_path
+
+    csr_path = ensure_suffix(out_path, ".csr")
+    return csr_path, f"{csr_path}.bin"
+
+
 def compute_eigenvector_scores(n, row_ptr, col_idx, max_iter=1000, tol=1e-6):
     """Compute leading-eigenvector scores using power iteration on CSR."""
     if n == 0:
@@ -172,10 +188,7 @@ def main():
 
     in_path  = sys.argv[1]
     out_path = sys.argv[2]
-
-    if out_path.endswith(".csr.bin"):
-        out_path = out_path[:-4]
-        print(f"Adjusted output path to .csr: {out_path}")
+    csr_path, csr_bin_path = resolve_output_paths(out_path)
 
     # --- Load ---
     t0 = time.perf_counter()
@@ -211,60 +224,16 @@ def main():
     mem_bytes = 4 * ((n + 1) + nnz + nnz)   # row_ptr + col_idx + vals
     print(f"  Est. GPU memory   : {mem_bytes / 1e6:.2f} MB (CSR arrays only)")
 
-    # --- Write CSR ---
-    write_binary(out_path, n, nnz, row_ptr, col_idx, vals)
+    # --- Write CSR outputs ---
+    write_binary(csr_path, n, nnz, row_ptr, col_idx, vals)
+    write_binary(csr_bin_path, n, nnz, row_ptr, col_idx, vals)
     t3 = time.perf_counter()
-    file_size = os.path.getsize(out_path)
-    print(f"\nWrote binary CSR  : {out_path}  ({file_size / 1e6:.2f} MB)  "
-          f"in {(t3-t2)*1e3:.1f} ms")
+    csr_size = os.path.getsize(csr_path)
+    csr_bin_size = os.path.getsize(csr_bin_path)
+    print(f"\nWrote CSR file    : {csr_path}  ({csr_size / 1e6:.2f} MB)")
+    print(f"Wrote CSR.BIN file: {csr_bin_path}  ({csr_bin_size / 1e6:.2f} MB)")
+    print(f"Write time        : {(t3-t2)*1e3:.1f} ms")
     print(f"Total time        : {(t3-t0)*1e3:.1f} ms")
-
-    # --- Eigenvector centrality artifacts ---
-    print("\nComputing eigenvector centrality (power iteration on CSR)...")
-    eig_scores, converged, eig_runtime = compute_eigenvector_scores(n, row_ptr, col_idx)
-
-    compact_to_orig = [None] * n
-    for orig, compact in node_map.items():
-        compact_to_orig[compact] = orig
-
-    score_rows = [(int(compact_to_orig[i]), float(eig_scores[i])) for i in range(n)]
-    score_rows.sort(key=lambda x: x[1], reverse=True)
-
-    output_stem = os.path.splitext(os.path.basename(out_path))[0]
-    baseline_dir = os.path.join("baseline", "cu_sparse")
-    os.makedirs(baseline_dir, exist_ok=True)
-    scores_csv_path = ensure_suffix(
-        os.path.join(baseline_dir, f"{output_stem}_eigenvector_scores"), ".csv"
-    )
-    metrics_json_path = ensure_suffix(
-        os.path.join(baseline_dir, f"{output_stem}_metrics"), ".json"
-    )
-
-    write_scores_csv(scores_csv_path, score_rows)
-
-    metrics = {
-        "input_file": in_path,
-        "csr_file": out_path,
-        "num_nodes": int(n),
-        "num_edges_undirected": int(nnz // 2),
-        "nnz": int(nnz),
-        "avg_degree": float(avg_deg),
-        "max_degree": int(max_deg),
-        "min_degree": int(min_deg),
-        "density": float(density),
-        "estimated_gpu_memory_mb": float(mem_bytes / 1e6),
-        "method": "power_iteration_csr",
-        "max_iter": 1000,
-        "tol": 1e-6,
-        "runtime_seconds": float(eig_runtime),
-        "converged": bool(converged),
-        "top_node_id": int(score_rows[0][0]) if score_rows else None,
-        "top_score": float(score_rows[0][1]) if score_rows else None,
-    }
-    write_metrics_json(metrics_json_path, metrics)
-
-    print(f"Saved eigen scores : {scores_csv_path}")
-    print(f"Saved metrics      : {metrics_json_path}")
 
     # Binary layout reminder for the CUDA reader
     print(f"\nBinary layout (all little-endian):")

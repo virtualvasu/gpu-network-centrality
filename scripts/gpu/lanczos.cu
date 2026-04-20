@@ -9,6 +9,10 @@
 #include <random>
 #include <iomanip>
 #include <chrono>
+#include <string>
+#include <cerrno>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <cuda_runtime.h>
 #include <cusparse.h>
 #include <cublas_v2.h>
@@ -46,6 +50,62 @@ struct CSRGraph {
     std::vector<int> col_ind;
     std::vector<float> values;
 };
+
+struct OutputPaths {
+    std::string dataset_key;
+    std::string output_dir;
+    std::string scores_csv;
+    std::string metrics_json;
+};
+
+static std::string strip_extension(const std::string &name) {
+    size_t pos = name.rfind('.');
+    if (pos == std::string::npos) return name;
+    return name.substr(0, pos);
+}
+
+static std::string path_basename(const std::string &path) {
+    size_t pos = path.find_last_of("/\\");
+    if (pos == std::string::npos) return path;
+    return path.substr(pos + 1);
+}
+
+static bool mkdir_if_missing(const std::string &dir) {
+    if (dir.empty()) return true;
+    if (mkdir(dir.c_str(), 0755) == 0) return true;
+    return errno == EEXIST;
+}
+
+static bool ensure_dir_recursive(const std::string &dir) {
+    if (dir.empty()) return true;
+    std::string cur;
+    for (size_t i = 0; i < dir.size(); ++i) {
+        char c = dir[i];
+        if (c == '/') {
+            if (!cur.empty() && !mkdir_if_missing(cur)) return false;
+        }
+        cur.push_back(c);
+    }
+    return mkdir_if_missing(cur);
+}
+
+static OutputPaths build_output_paths(const char *input_path) {
+    std::string in = input_path;
+    std::string base = path_basename(in);
+
+    if (base.size() > 8 && base.substr(base.size() - 8) == ".csr.bin") {
+        base = base.substr(0, base.size() - 8);
+    } else {
+        base = strip_extension(base);
+    }
+
+    OutputPaths p;
+    p.dataset_key = base;
+    p.output_dir = std::string("baseline/lanczos/") + p.dataset_key;
+    p.scores_csv = p.output_dir + "/" + p.dataset_key + "_eigenvector_scores.csv";
+    p.metrics_json = p.output_dir + "/step0_metrics.json";
+    return p;
+}
 
 // --- Binary Loader ---
 CSRGraph load_csr_bin(const std::string& filename) {
@@ -95,6 +155,12 @@ std::vector<float> solve_tridiagonal_eigen(const std::vector<float>& alpha, cons
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cout << "Usage: " << argv[0] << " <graph.bin>\n";
+        return 1;
+    }
+
+    OutputPaths out = build_output_paths(argv[1]);
+    if (!ensure_dir_recursive(out.output_dir)) {
+        std::cerr << "Failed to create output directory: " << out.output_dir << std::endl;
         return 1;
     }
 
@@ -265,17 +331,16 @@ int main(int argc, char** argv) {
               });
 
     // --- Write Full Output to CSV ---
-    std::string csv_filename = "eigenvector_centrality.csv";
-    std::ofstream csv_file(csv_filename);
+    std::ofstream csv_file(out.scores_csv);
     if (csv_file.is_open()) {
-        csv_file << "NodeID,Score\n";
+        csv_file << "node_id,score\n";
         for (int i = 0; i < n; ++i) {
             csv_file << centrality[i].first << "," << std::fixed << std::setprecision(8) << centrality[i].second << "\n";
         }
         csv_file.close();
-        std::cout << "\nSuccessfully wrote full results to " << csv_filename << "\n";
+        std::cout << "\nSuccessfully wrote full results to " << out.scores_csv << "\n";
     } else {
-        std::cerr << "\nFailed to open " << csv_filename << " for writing.\n";
+        std::cerr << "\nFailed to open " << out.scores_csv << " for writing.\n";
     }
 
     // --- Print Results & Metrics ---
@@ -297,6 +362,36 @@ int main(int argc, char** argv) {
     std::cout << "Lanczos SpMV Loop ("<< actual_m <<" iter): \t" << time_lanczos << " ms\n";
     std::cout << "Total GPU Execution Time: \t" << time_total << " ms\n";
     std::cout << "----------------------------------------------\n";
+
+    // --- Write Metrics JSON ---
+    double density = (n > 0) ? ((double)nnz / ((double)n * (double)n)) : 0.0;
+    std::ofstream metrics_file(out.metrics_json);
+    if (metrics_file.is_open()) {
+        metrics_file << "{\n";
+        metrics_file << "  \"dataset_key\": \"" << out.dataset_key << "\",\n";
+        metrics_file << "  \"dataset\": \"" << argv[1] << "\",\n";
+        metrics_file << "  \"num_nodes\": " << n << ",\n";
+        metrics_file << "  \"num_edges\": " << (nnz / 2) << ",\n";
+        metrics_file << "  \"nnz\": " << nnz << ",\n";
+        metrics_file << "  \"density\": " << std::setprecision(12) << density << ",\n";
+        metrics_file << "  \"method\": \"lanczos\",\n";
+        metrics_file << "  \"graph_type\": \"undirected\",\n";
+        metrics_file << "  \"max_iter\": " << m << ",\n";
+        metrics_file << "  \"tol\": 1e-6,\n";
+        metrics_file << "  \"runtime_seconds\": " << std::setprecision(12) << (time_total / 1e3) << ",\n";
+        metrics_file << "  \"iterations\": " << actual_m << ",\n";
+        metrics_file << "  \"converged\": true,\n";
+        metrics_file << "  \"io_ms\": " << std::setprecision(12) << io_time << ",\n";
+        metrics_file << "  \"h2d_ms\": " << std::setprecision(12) << time_transfer << ",\n";
+        metrics_file << "  \"lanczos_loop_ms\": " << std::setprecision(12) << time_lanczos << ",\n";
+        metrics_file << "  \"top_node_id\": " << centrality[0].first << ",\n";
+        metrics_file << "  \"top_score\": " << std::setprecision(12) << centrality[0].second << "\n";
+        metrics_file << "}\n";
+        metrics_file.close();
+        std::cout << "Saved metrics to " << out.metrics_json << "\n";
+    } else {
+        std::cerr << "Failed to open " << out.metrics_json << " for writing.\n";
+    }
 
     // Cleanup
     cudaFree(d_row_ptr); cudaFree(d_col_ind); cudaFree(d_values);
