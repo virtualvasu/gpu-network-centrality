@@ -1,6 +1,9 @@
 # Exclude all dataset assets (raw + CSR) from version control
 dataset/
 
+# Exclude generated baseline outputs
+baseline/
+
 # Python
 __pycache__/
 *.py[cod]
