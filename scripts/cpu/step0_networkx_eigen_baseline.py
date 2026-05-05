@@ -43,14 +43,40 @@ TOP_K = 20
 
 
 def load_binary_csr(path: Path):
-    """Load binary CSR file written by txt_to_csr.py (.csr or .csr.bin)."""
+    """Load binary CSR file in either 32-bit or 64-bit-header layout."""
+    file_size = path.stat().st_size
     with path.open("rb") as f:
-        header = f.read(8)
-        if len(header) != 8:
+        n_raw = f.read(4)
+        probe = f.read(8)
+        if len(n_raw) != 4 or len(probe) != 8:
             raise RuntimeError(f"Invalid CSR file header: {path}")
 
-        num_nodes, nnz = struct.unpack("<ii", header)
-        indptr = np.fromfile(f, dtype=np.int32, count=num_nodes + 1).astype(np.int64)
+        num_nodes = struct.unpack("<i", n_raw)[0]
+        nnz32 = struct.unpack("<i", probe[:4])[0]
+        nnz64 = struct.unpack("<q", probe)[0]
+
+        size32 = 4 + 4 + (num_nodes + 1) * 4 + nnz32 * 4 + nnz32 * 4 if num_nodes > 0 and nnz32 >= 0 else -1
+        size64 = 4 + 8 + (num_nodes + 1) * 8 + nnz64 * 4 + nnz64 * 4 if num_nodes > 0 and nnz64 >= 0 else -1
+
+        is32 = size32 == file_size
+        is64 = size64 == file_size
+        if not is32 and not is64:
+            raise RuntimeError(
+                "Unrecognized CSR format in "
+                f"{path}: size={file_size}, n={num_nodes}, nnz32={nnz32}, nnz64={nnz64}"
+            )
+
+        f.seek(0)
+        if is64:
+            num_nodes = struct.unpack("<i", f.read(4))[0]
+            nnz = struct.unpack("<q", f.read(8))[0]
+            if nnz > np.iinfo(np.int64).max:
+                raise RuntimeError(f"nnz too large in {path}: {nnz}")
+            indptr = np.fromfile(f, dtype=np.int64, count=num_nodes + 1)
+        else:
+            num_nodes, nnz = struct.unpack("<ii", f.read(8))
+            indptr = np.fromfile(f, dtype=np.int32, count=num_nodes + 1).astype(np.int64)
+
         indices = np.fromfile(f, dtype=np.int32, count=nnz).astype(np.int64)
         data = np.fromfile(f, dtype=np.float32, count=nnz).astype(np.float64)
 
@@ -59,6 +85,8 @@ def load_binary_csr(path: Path):
             f"Incomplete CSR binary content in {path}. "
             f"Expected nodes={num_nodes}, nnz={nnz}."
         )
+    if indptr[0] != 0 or indptr[-1] != nnz or np.any(np.diff(indptr) < 0):
+        raise RuntimeError(f"Invalid CSR row pointer array in {path}.")
 
     num_edges = nnz // 2
     return indptr, indices, data, num_nodes, num_edges

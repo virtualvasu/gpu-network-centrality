@@ -23,6 +23,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <vector>
 #include <algorithm>
 #include <numeric>
@@ -100,7 +102,7 @@ struct CudaTimer {
 //     (those threads become the bottleneck; others sit idle).
 // ---------------------------------------------------------------------------
 __global__ void csr_scalar_spmv(
-    const int   *__restrict__ row_ptr,   // [n+1]
+    const int64_t *__restrict__ row_ptr, // [n+1]
     const int   *__restrict__ col_idx,   // [nnz]
     const float *__restrict__ vals,      // [nnz]
     const float *__restrict__ x,         // input vector  [n]
@@ -110,11 +112,11 @@ __global__ void csr_scalar_spmv(
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= n) return;
 
-    int   row_start = row_ptr[row];
-    int   row_end   = row_ptr[row + 1];
+    int64_t row_start = row_ptr[row];
+    int64_t row_end   = row_ptr[row + 1];
     float acc       = 0.f;
 
-    for (int j = row_start; j < row_end; ++j)
+    for (int64_t j = row_start; j < row_end; ++j)
         acc += vals[j] * x[col_idx[j]];
 
     y[row] = acc;
@@ -135,8 +137,9 @@ __global__ void normalize_inplace(float *v, float inv_norm, int n)
 // CSR loader
 // ---------------------------------------------------------------------------
 struct CsrGraph {
-    int n, nnz;
-    std::vector<int>   row_ptr;
+    int n;
+    int64_t nnz;
+    std::vector<int64_t> row_ptr;
     std::vector<int>   col_idx;
     std::vector<float> vals;
 };
@@ -146,16 +149,86 @@ static bool load_csr_binary(const char *path, CsrGraph &g)
     FILE *f = fopen(path, "rb");
     if (!f) { perror(path); return false; }
 
-    if (fread(&g.n,   sizeof(int), 1, f) != 1) { fclose(f); return false; }
-    if (fread(&g.nnz, sizeof(int), 1, f) != 1) { fclose(f); return false; }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    long long file_size = ftell(f);
+    if (file_size < 0) { fclose(f); return false; }
+    rewind(f);
 
-    g.row_ptr.resize(g.n + 1);
-    g.col_idx.resize(g.nnz);
-    g.vals.resize(g.nnz);
+    int32_t n32 = 0;
+    if (fread(&n32, sizeof(int32_t), 1, f) != 1) { fclose(f); return false; }
 
-    if ((int)fread(g.row_ptr.data(), sizeof(int),   g.n + 1, f) != g.n + 1) { fclose(f); return false; }
-    if ((int)fread(g.col_idx.data(), sizeof(int),   g.nnz,   f) != g.nnz)   { fclose(f); return false; }
-    if ((int)fread(g.vals.data(),    sizeof(float), g.nnz,   f) != g.nnz)   { fclose(f); return false; }
+    unsigned char nnz_probe[8] = {0};
+    if (fread(nnz_probe, 1, sizeof(nnz_probe), f) != sizeof(nnz_probe)) { fclose(f); return false; }
+
+    int32_t nnz32 = 0;
+    int64_t nnz64 = 0;
+    memcpy(&nnz32, nnz_probe, sizeof(int32_t));
+    memcpy(&nnz64, nnz_probe, sizeof(int64_t));
+
+    auto size_matches_32 = [&](int32_t n, int32_t nnz) {
+        if (n <= 0 || nnz < 0) return false;
+        __int128 expected = 0;
+        expected += 4;
+        expected += 4;
+        expected += static_cast<__int128>(n + 1) * 4;
+        expected += static_cast<__int128>(nnz) * 4;
+        expected += static_cast<__int128>(nnz) * 4;
+        return expected == file_size;
+    };
+
+    auto size_matches_64 = [&](int32_t n, int64_t nnz) {
+        if (n <= 0 || nnz < 0) return false;
+        __int128 expected = 0;
+        expected += 4;
+        expected += 8;
+        expected += static_cast<__int128>(n + 1) * 8;
+        expected += static_cast<__int128>(nnz) * 4;
+        expected += static_cast<__int128>(nnz) * 4;
+        return expected == file_size;
+    };
+
+    const bool is_64 = size_matches_64(n32, nnz64);
+    const bool is_32 = size_matches_32(n32, nnz32);
+    if (!is_64 && !is_32) {
+        fprintf(stderr,
+                "Unrecognized CSR binary format: %s (size=%lld, n=%d, nnz32=%d, nnz64=%lld)\n",
+                path, file_size, static_cast<int>(n32), static_cast<int>(nnz32), static_cast<long long>(nnz64));
+        fclose(f);
+        return false;
+    }
+
+    rewind(f);
+    g.n = n32;
+
+    if (is_64) {
+        if (fread(&g.n, sizeof(int32_t), 1, f) != 1) { fclose(f); return false; }
+        if (fread(&g.nnz, sizeof(int64_t), 1, f) != 1) { fclose(f); return false; }
+
+        g.row_ptr.resize(static_cast<size_t>(g.n) + 1);
+        g.col_idx.resize(static_cast<size_t>(g.nnz));
+        g.vals.resize(static_cast<size_t>(g.nnz));
+
+        if (fread(g.row_ptr.data(), sizeof(int64_t), static_cast<size_t>(g.n) + 1, f) != static_cast<size_t>(g.n) + 1) { fclose(f); return false; }
+        if (fread(g.col_idx.data(), sizeof(int), static_cast<size_t>(g.nnz), f) != static_cast<size_t>(g.nnz)) { fclose(f); return false; }
+        if (fread(g.vals.data(), sizeof(float), static_cast<size_t>(g.nnz), f) != static_cast<size_t>(g.nnz)) { fclose(f); return false; }
+    } else {
+        int32_t legacy_nnz = 0;
+        if (fread(&g.n, sizeof(int32_t), 1, f) != 1) { fclose(f); return false; }
+        if (fread(&legacy_nnz, sizeof(int32_t), 1, f) != 1) { fclose(f); return false; }
+        g.nnz = legacy_nnz;
+
+        std::vector<int32_t> row_ptr32(static_cast<size_t>(g.n) + 1);
+        g.row_ptr.resize(static_cast<size_t>(g.n) + 1);
+        g.col_idx.resize(static_cast<size_t>(g.nnz));
+        g.vals.resize(static_cast<size_t>(g.nnz));
+
+        if (fread(row_ptr32.data(), sizeof(int32_t), static_cast<size_t>(g.n) + 1, f) != static_cast<size_t>(g.n) + 1) { fclose(f); return false; }
+        for (size_t i = 0; i < static_cast<size_t>(g.n) + 1; ++i) {
+            g.row_ptr[i] = row_ptr32[i];
+        }
+        if (fread(g.col_idx.data(), sizeof(int), static_cast<size_t>(g.nnz), f) != static_cast<size_t>(g.nnz)) { fclose(f); return false; }
+        if (fread(g.vals.data(), sizeof(float), static_cast<size_t>(g.nnz), f) != static_cast<size_t>(g.nnz)) { fclose(f); return false; }
+    }
 
     fclose(f);
     return true;
@@ -269,8 +342,8 @@ static bool write_metrics_json(const std::string &path, const OutputPaths &out,
     fprintf(f, "  \"dataset_key\": \"%s\",\n", out.dataset_key.c_str());
     fprintf(f, "  \"dataset\": \"%s\",\n", input_path);
     fprintf(f, "  \"num_nodes\": %d,\n", g.n);
-    fprintf(f, "  \"num_edges\": %d,\n", g.nnz / 2);
-    fprintf(f, "  \"nnz\": %d,\n", g.nnz);
+    fprintf(f, "  \"num_edges\": %lld,\n", (long long)(g.nnz / 2));
+    fprintf(f, "  \"nnz\": %lld,\n", (long long)g.nnz);
     fprintf(f, "  \"density\": %.12g,\n", density);
     fprintf(f, "  \"method\": \"csr_scalar.power_iteration\",\n");
     fprintf(f, "  \"graph_type\": \"undirected\",\n");
@@ -309,17 +382,18 @@ static void run_evcent_scalar(
     std::vector<float> &h_scores,
     EvcMetrics         &m)
 {
-    const int n   = g.n;
-    const int nnz = g.nnz;
+    const int n = g.n;
+    const int64_t nnz = g.nnz;
 
     // ---- Device allocations ----
-    int   *d_row_ptr, *d_col_idx;
+    int64_t *d_row_ptr;
+    int *d_col_idx;
     float *d_vals;
     float *d_v, *d_v_new, *d_diff;
 
-    CUDA_CHECK(cudaMalloc(&d_row_ptr, (n + 1) * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_col_idx,  nnz     * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_vals,     nnz     * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_row_ptr, (static_cast<size_t>(n) + 1) * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&d_col_idx,  static_cast<size_t>(nnz) * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_vals,     static_cast<size_t>(nnz) * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_v,        n       * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_v_new,    n       * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_diff,     n       * sizeof(float)));
@@ -327,9 +401,9 @@ static void run_evcent_scalar(
     // ---- H2D ----
     CudaTimer h2d_timer;
     h2d_timer.begin();
-    CUDA_CHECK(cudaMemcpy(d_row_ptr, g.row_ptr.data(), (n + 1) * sizeof(int),   cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_col_idx, g.col_idx.data(),  nnz     * sizeof(int),   cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_vals,    g.vals.data(),     nnz     * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_row_ptr, g.row_ptr.data(), (static_cast<size_t>(n) + 1) * sizeof(int64_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_col_idx, g.col_idx.data(), static_cast<size_t>(nnz) * sizeof(int),          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_vals,    g.vals.data(),    static_cast<size_t>(nnz) * sizeof(float),        cudaMemcpyHostToDevice));
     m.h2d_ms = h2d_timer.end();
 
     // ---- Initialise v = 1/sqrt(n) ----
@@ -388,7 +462,7 @@ static void run_evcent_scalar(
 
     // -- Performance metrics --
     // SpMV: 2 FLOPs per non-zero (multiply + add)
-    m.gflops = 2.0 * nnz * iter / (total_spmv_ms * 1e-3) / 1e9;
+    m.gflops = 2.0 * static_cast<double>(nnz) * iter / (total_spmv_ms * 1e-3) / 1e9;
 
     // SpMV bytes per iteration:
     //   row_ptr : 4 * (n+1)   -- two loads per row but amortised as ~1 per row
@@ -396,7 +470,7 @@ static void run_evcent_scalar(
     //   vals    : 4 * nnz
     //   x read  : 4 * nnz     -- worst case: every col is distinct (random gather)
     //   y write : 4 * n
-    double bytes_per_iter = 4.0 * ((n + 1) + 2.0 * nnz + nnz + n);
+    double bytes_per_iter = 8.0 * (n + 1) + 4.0 * (3.0 * static_cast<double>(nnz) + n);
     m.gbps = bytes_per_iter * iter / (total_spmv_ms * 1e-3) / 1e9;
 
     // ---- D2H ----
@@ -425,7 +499,7 @@ static void degree_stats(const CsrGraph &g,
     mx = 0; mn = INT_MAX;
     long long sum = 0;
     for (int i = 0; i < g.n; ++i) {
-        int d = g.row_ptr[i + 1] - g.row_ptr[i];
+        int d = static_cast<int>(g.row_ptr[i + 1] - g.row_ptr[i]);
         sum += d;
         if (d > mx) mx = d;
         if (d < mn) mn = d;
@@ -490,10 +564,10 @@ int main(int argc, char **argv)
     degree_stats(g, avg_deg, max_deg, min_deg);
 
     int grid = (g.n + block_size - 1) / block_size;
-    double csr_mb = 4.0 * ((g.n + 1) + g.nnz + g.nnz) / 1e6;
+    double csr_mb = (8.0 * (g.n + 1) + 4.0 * g.nnz + 4.0 * g.nnz) / 1e6;
 
     printf("  Vertices   : %d\n",     g.n);
-    printf("  Edges      : %d  (%d directed nnz)\n", g.nnz / 2, g.nnz);
+    printf("  Edges      : %lld  (%lld directed nnz)\n", (long long)(g.nnz / 2), (long long)g.nnz);
     printf("  Avg degree : %.2f  |  Max : %d  |  Min : %d\n",
            avg_deg, max_deg, min_deg);
     printf("  CSR memory : %.2f MB\n", csr_mb);

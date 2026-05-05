@@ -9,6 +9,9 @@
 #include <algorithm>
 #include <chrono>
 #include <string>
+#include <cstring>
+#include <cstdint>
+#include <limits>
 #include <cerrno>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -71,6 +74,142 @@ static OutputPaths build_output_paths(const char *input_path) {
     p.scores_csv = p.output_dir + "/" + p.dataset_key + "_eigenvector_scores.csv";
     p.metrics_json = p.output_dir + "/step0_metrics.json";
     return p;
+}
+
+struct CsrGraphHost {
+    int n = 0;
+    int nnz = 0;
+    std::vector<int> row_ptr;
+    std::vector<int> col_ind;
+    std::vector<float> vals;
+};
+
+static bool load_csr_binary_compat(const char* path, CsrGraphHost& g) {
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "Failed to open %s\n", path);
+        return false;
+    }
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return false;
+    }
+    long long file_size = ftell(f);
+    if (file_size < 0) {
+        fclose(f);
+        return false;
+    }
+    rewind(f);
+
+    int32_t n32 = 0;
+    if (fread(&n32, sizeof(int32_t), 1, f) != 1) {
+        fclose(f);
+        return false;
+    }
+
+    unsigned char nnz_probe[8] = {0};
+    if (fread(nnz_probe, 1, sizeof(nnz_probe), f) != sizeof(nnz_probe)) {
+        fclose(f);
+        return false;
+    }
+
+    int32_t nnz32 = 0;
+    int64_t nnz64 = 0;
+    memcpy(&nnz32, nnz_probe, sizeof(int32_t));
+    memcpy(&nnz64, nnz_probe, sizeof(int64_t));
+
+    auto size_matches_32 = [&](int32_t n, int32_t nnz) {
+        if (n <= 0 || nnz < 0) return false;
+        __int128 expected = 0;
+        expected += 4;
+        expected += 4;
+        expected += static_cast<__int128>(n + 1) * 4;
+        expected += static_cast<__int128>(nnz) * 4;
+        expected += static_cast<__int128>(nnz) * 4;
+        return expected == file_size;
+    };
+
+    auto size_matches_64 = [&](int32_t n, int64_t nnz) {
+        if (n <= 0 || nnz < 0) return false;
+        __int128 expected = 0;
+        expected += 4;
+        expected += 8;
+        expected += static_cast<__int128>(n + 1) * 8;
+        expected += static_cast<__int128>(nnz) * 4;
+        expected += static_cast<__int128>(nnz) * 4;
+        return expected == file_size;
+    };
+
+    const bool is_64 = size_matches_64(n32, nnz64);
+    const bool is_32 = size_matches_32(n32, nnz32);
+    if (!is_64 && !is_32) {
+        fprintf(stderr,
+                "Unrecognized CSR binary format: %s (size=%lld, n=%d, nnz32=%d, nnz64=%lld)\n",
+                path, file_size, static_cast<int>(n32), static_cast<int>(nnz32), static_cast<long long>(nnz64));
+        fclose(f);
+        return false;
+    }
+
+    rewind(f);
+    if (is_64) {
+        int64_t nnz_read = 0;
+        if (fread(&n32, sizeof(int32_t), 1, f) != 1 || fread(&nnz_read, sizeof(int64_t), 1, f) != 1) {
+            fclose(f);
+            return false;
+        }
+        if (nnz_read < 0 || nnz_read > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+            fprintf(stderr, "nnz out of int range for this implementation: %lld\n", static_cast<long long>(nnz_read));
+            fclose(f);
+            return false;
+        }
+
+        std::vector<int64_t> row_ptr64(static_cast<size_t>(n32) + 1);
+        g.col_ind.resize(static_cast<size_t>(nnz_read));
+        g.vals.resize(static_cast<size_t>(nnz_read));
+        g.row_ptr.resize(static_cast<size_t>(n32) + 1);
+
+        if (fread(row_ptr64.data(), sizeof(int64_t), static_cast<size_t>(n32) + 1, f) != static_cast<size_t>(n32) + 1 ||
+            fread(g.col_ind.data(), sizeof(int), static_cast<size_t>(nnz_read), f) != static_cast<size_t>(nnz_read) ||
+            fread(g.vals.data(), sizeof(float), static_cast<size_t>(nnz_read), f) != static_cast<size_t>(nnz_read)) {
+            fclose(f);
+            return false;
+        }
+
+        for (size_t i = 0; i < g.row_ptr.size(); ++i) {
+            if (row_ptr64[i] < 0 || row_ptr64[i] > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+                fprintf(stderr, "row_ptr[%zu]=%lld out of int range for this implementation\n", i,
+                        static_cast<long long>(row_ptr64[i]));
+                fclose(f);
+                return false;
+            }
+            g.row_ptr[i] = static_cast<int>(row_ptr64[i]);
+        }
+        g.n = n32;
+        g.nnz = static_cast<int>(nnz_read);
+    } else {
+        int32_t nnz_read = 0;
+        if (fread(&n32, sizeof(int32_t), 1, f) != 1 || fread(&nnz_read, sizeof(int32_t), 1, f) != 1) {
+            fclose(f);
+            return false;
+        }
+
+        g.n = n32;
+        g.nnz = nnz_read;
+        g.row_ptr.resize(static_cast<size_t>(g.n) + 1);
+        g.col_ind.resize(static_cast<size_t>(g.nnz));
+        g.vals.resize(static_cast<size_t>(g.nnz));
+
+        if (fread(g.row_ptr.data(), sizeof(int), static_cast<size_t>(g.n) + 1, f) != static_cast<size_t>(g.n) + 1 ||
+            fread(g.col_ind.data(), sizeof(int), static_cast<size_t>(g.nnz), f) != static_cast<size_t>(g.nnz) ||
+            fread(g.vals.data(), sizeof(float), static_cast<size_t>(g.nnz), f) != static_cast<size_t>(g.nnz)) {
+            fclose(f);
+            return false;
+        }
+    }
+
+    fclose(f);
+    return true;
 }
 
 // --- KERNELS ---
@@ -162,31 +301,14 @@ void run_optimized_evcent(const char* path, int max_iter, float tol, int top_k) 
         return;
     }
 
-    FILE* f = fopen(path, "rb");
-    int n, nnz;
-    if (!f) {
-        fprintf(stderr, "Failed to open %s\n", path);
+    CsrGraphHost graph;
+    if (!load_csr_binary_compat(path, graph)) {
+        fprintf(stderr, "Failed to parse CSR binary: %s\n", path);
         return;
     }
 
-    if (fread(&n, sizeof(int), 1, f) != 1 || fread(&nnz, sizeof(int), 1, f) != 1) {
-        fprintf(stderr, "Failed to read graph header from %s\n", path);
-        fclose(f);
-        return;
-    }
-
-    std::vector<int> h_row_ptr(n + 1);
-    std::vector<int> h_col_ind(nnz);
-    std::vector<float> h_vals(nnz);
-
-    if (fread(h_row_ptr.data(), sizeof(int), n + 1, f) != (size_t)(n + 1) ||
-        fread(h_col_ind.data(), sizeof(int), nnz, f) != (size_t)nnz ||
-        fread(h_vals.data(), sizeof(float), nnz, f) != (size_t)nnz) {
-        fprintf(stderr, "Failed to read CSR arrays from %s\n", path);
-        fclose(f);
-        return;
-    }
-    fclose(f);
+    const int n = graph.n;
+    const int nnz = graph.nnz;
 
     int *d_row_ptr, *d_col_ind;
     float *d_vals, *d_x, *d_y, *d_diff_abs, *d_partial, *d_final;
@@ -203,9 +325,9 @@ void run_optimized_evcent(const char* path, int max_iter, float tol, int top_k) 
     CUDA_CHECK(cudaMalloc(&d_partial, num_blocks_reduce * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_final, sizeof(float)));
 
-    CUDA_CHECK(cudaMemcpy(d_row_ptr, h_row_ptr.data(), (n + 1) * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_col_ind, h_col_ind.data(), nnz * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_vals, h_vals.data(), nnz * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_row_ptr, graph.row_ptr.data(), (n + 1) * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_col_ind, graph.col_ind.data(), nnz * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_vals, graph.vals.data(), nnz * sizeof(float), cudaMemcpyHostToDevice));
 
     std::vector<float> h_x(n, 1.0f / sqrtf((float)n));
     CUDA_CHECK(cudaMemcpy(d_x, h_x.data(), n * sizeof(float), cudaMemcpyHostToDevice));

@@ -5,11 +5,14 @@
 #include <vector>
 #include <fstream>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <algorithm>
 #include <random>
 #include <iomanip>
 #include <chrono>
 #include <string>
+#include <limits>
 #include <cerrno>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -109,23 +112,140 @@ static OutputPaths build_output_paths(const char *input_path) {
 
 // --- Binary Loader ---
 CSRGraph load_csr_bin(const std::string& filename) {
-    std::ifstream file(filename, std::ios::binary);
-    if (!file) {
+    FILE *f = fopen(filename.c_str(), "rb");
+    if (!f) {
         std::cerr << "Failed to open " << filename << std::endl;
         exit(EXIT_FAILURE);
     }
 
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        std::cerr << "Failed to seek " << filename << std::endl;
+        exit(EXIT_FAILURE);
+    }
+    long long file_size = ftell(f);
+    if (file_size < 0) {
+        fclose(f);
+        std::cerr << "Failed to read size for " << filename << std::endl;
+        exit(EXIT_FAILURE);
+    }
+    rewind(f);
+
+    int32_t n32 = 0;
+    if (fread(&n32, sizeof(int32_t), 1, f) != 1) {
+        fclose(f);
+        std::cerr << "Failed to read n from " << filename << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    unsigned char nnz_probe[8] = {0};
+    if (fread(nnz_probe, 1, sizeof(nnz_probe), f) != sizeof(nnz_probe)) {
+        fclose(f);
+        std::cerr << "Failed to read nnz probe from " << filename << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    int32_t nnz32 = 0;
+    int64_t nnz64 = 0;
+    memcpy(&nnz32, nnz_probe, sizeof(int32_t));
+    memcpy(&nnz64, nnz_probe, sizeof(int64_t));
+
+    auto size_matches_32 = [&](int32_t n, int32_t nnz) {
+        if (n <= 0 || nnz < 0) return false;
+        __int128 expected = 0;
+        expected += 4;
+        expected += 4;
+        expected += static_cast<__int128>(n + 1) * 4;
+        expected += static_cast<__int128>(nnz) * 4;
+        expected += static_cast<__int128>(nnz) * 4;
+        return expected == file_size;
+    };
+
+    auto size_matches_64 = [&](int32_t n, int64_t nnz) {
+        if (n <= 0 || nnz < 0) return false;
+        __int128 expected = 0;
+        expected += 4;
+        expected += 8;
+        expected += static_cast<__int128>(n + 1) * 8;
+        expected += static_cast<__int128>(nnz) * 4;
+        expected += static_cast<__int128>(nnz) * 4;
+        return expected == file_size;
+    };
+
+    const bool is_64 = size_matches_64(n32, nnz64);
+    const bool is_32 = size_matches_32(n32, nnz32);
+    if (!is_64 && !is_32) {
+        std::cerr << "Unrecognized CSR binary format: " << filename
+                  << " size=" << file_size
+                  << " n=" << n32
+                  << " nnz32=" << nnz32
+                  << " nnz64=" << nnz64 << std::endl;
+        fclose(f);
+        exit(EXIT_FAILURE);
+    }
+
+    rewind(f);
+
     CSRGraph graph;
-    file.read(reinterpret_cast<char*>(&graph.num_nodes), sizeof(int));
-    file.read(reinterpret_cast<char*>(&graph.num_edges), sizeof(int));
 
-    graph.row_ptr.resize(graph.num_nodes + 1);
-    graph.col_ind.resize(graph.num_edges);
-    graph.values.resize(graph.num_edges);
+    if (is_64) {
+        int64_t nnz_read = 0;
+        if (fread(&graph.num_nodes, sizeof(int32_t), 1, f) != 1 ||
+            fread(&nnz_read, sizeof(int64_t), 1, f) != 1) {
+            fclose(f);
+            std::cerr << "Failed to read 64-bit header from " << filename << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        if (nnz_read < 0 || nnz_read > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+            fclose(f);
+            std::cerr << "nnz out of range for current implementation: " << nnz_read << std::endl;
+            exit(EXIT_FAILURE);
+        }
 
-    file.read(reinterpret_cast<char*>(graph.row_ptr.data()), (graph.num_nodes + 1) * sizeof(int));
-    file.read(reinterpret_cast<char*>(graph.col_ind.data()), graph.num_edges * sizeof(int));
-    file.read(reinterpret_cast<char*>(graph.values.data()), graph.num_edges * sizeof(float));
+        std::vector<int64_t> row_ptr64(static_cast<size_t>(graph.num_nodes) + 1);
+        graph.num_edges = static_cast<int>(nnz_read);
+        graph.row_ptr.resize(static_cast<size_t>(graph.num_nodes) + 1);
+        graph.col_ind.resize(static_cast<size_t>(graph.num_edges));
+        graph.values.resize(static_cast<size_t>(graph.num_edges));
+
+        if (fread(row_ptr64.data(), sizeof(int64_t), static_cast<size_t>(graph.num_nodes) + 1, f) != static_cast<size_t>(graph.num_nodes) + 1 ||
+            fread(graph.col_ind.data(), sizeof(int), static_cast<size_t>(graph.num_edges), f) != static_cast<size_t>(graph.num_edges) ||
+            fread(graph.values.data(), sizeof(float), static_cast<size_t>(graph.num_edges), f) != static_cast<size_t>(graph.num_edges)) {
+            fclose(f);
+            std::cerr << "Failed to read CSR payload from " << filename << std::endl;
+            exit(EXIT_FAILURE);
+        }
+
+        for (size_t i = 0; i < graph.row_ptr.size(); ++i) {
+            if (row_ptr64[i] < 0 || row_ptr64[i] > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+                fclose(f);
+                std::cerr << "row_ptr[" << i << "] out of range for int32 offsets" << std::endl;
+                exit(EXIT_FAILURE);
+            }
+            graph.row_ptr[i] = static_cast<int>(row_ptr64[i]);
+        }
+    } else {
+        if (fread(&graph.num_nodes, sizeof(int32_t), 1, f) != 1 ||
+            fread(&graph.num_edges, sizeof(int32_t), 1, f) != 1) {
+            fclose(f);
+            std::cerr << "Failed to read 32-bit header from " << filename << std::endl;
+            exit(EXIT_FAILURE);
+        }
+
+        graph.row_ptr.resize(static_cast<size_t>(graph.num_nodes) + 1);
+        graph.col_ind.resize(static_cast<size_t>(graph.num_edges));
+        graph.values.resize(static_cast<size_t>(graph.num_edges));
+
+        if (fread(graph.row_ptr.data(), sizeof(int), static_cast<size_t>(graph.num_nodes) + 1, f) != static_cast<size_t>(graph.num_nodes) + 1 ||
+            fread(graph.col_ind.data(), sizeof(int), static_cast<size_t>(graph.num_edges), f) != static_cast<size_t>(graph.num_edges) ||
+            fread(graph.values.data(), sizeof(float), static_cast<size_t>(graph.num_edges), f) != static_cast<size_t>(graph.num_edges)) {
+            fclose(f);
+            std::cerr << "Failed to read CSR payload from " << filename << std::endl;
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    fclose(f);
 
     return graph;
 }
