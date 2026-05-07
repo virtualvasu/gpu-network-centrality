@@ -2,30 +2,31 @@
 """
 compare_accuracy.py
 
-Compare the top-20 eigenvector centrality scores across all 5 implementations.
+Compare the top-20 eigenvector centrality scores across all 6 implementations.
 Uses the NetworkX CPU baseline as ground truth.
 
-All implementations output CSV files with the same schema:
-    node_id,score
+All implementations output CSV files with columns:
+    node_id,score          (or node_id,centrality_score for merge-path)
     <int>,<float>
-Rows are sorted by score in descending order.
 
 Usage:
     python3 compare_accuracy.py \
-        --networkx  <path_to_networkx_scores.csv>  \
-        --our-code  <path_to_our_code_scores.csv>   \
-        --csr-scalar <path_to_csr_scalar_scores.csv> \
-        --cusparse  <path_to_cusparse_scores.csv>    \
-        --lanczos   <path_to_lanczos_scores.csv>     \
+        --networkx    <path_to_networkx_scores.csv>  \
+        --our-code    <path_to_our_code_scores.csv>   \
+        --csr-scalar  <path_to_csr_scalar_scores.csv> \
+        --cusparse    <path_to_cusparse_scores.csv>    \
+        --lanczos     <path_to_lanczos_scores.csv>     \
+        --merge-path  <path_to_mergepath_scores.csv>   \
         [--top-k 20]
 
 Example (from the scripts/ directory after running all implementations on roadNet-CA):
     python3 compare_accuracy.py \
-        --networkx   baseline/networkx/roadNet-CA/roadNet-CA_eigenvector_scores.csv \
-        --our-code   baseline/our_code/roadNet-CA/roadNet-CA_eigenvector_scores.csv \
-        --csr-scalar baseline/csr_scalar/roadNet-CA/roadNet-CA_eigenvector_scores.csv \
-        --cusparse   baseline/cu_sparse/roadNet-CA/roadNet-CA_eigenvector_scores.csv \
-        --lanczos    baseline/lanczos/roadNet-CA/roadNet-CA_eigenvector_scores.csv
+        --networkx    baseline/networkx/roadNet-CA/roadNet-CA_eigenvector_scores.csv \
+        --our-code    baseline/our_code/roadNet-CA/roadNet-CA_eigenvector_scores.csv \
+        --csr-scalar  baseline/csr_scalar/roadNet-CA/roadNet-CA_eigenvector_scores.csv \
+        --cusparse    baseline/cu_sparse/roadNet-CA/roadNet-CA_eigenvector_scores.csv \
+        --lanczos     baseline/lanczos/roadNet-CA/roadNet-CA_eigenvector_scores.csv \
+        --merge-path  gpu_scores_mergepath.csv
 """
 
 from __future__ import annotations
@@ -283,11 +284,12 @@ All other implementations are compared against it.
 
 Example:
     python3 compare_accuracy.py \\
-        --networkx   baseline/networkx/roadNet-CA/roadNet-CA_eigenvector_scores.csv \\
-        --our-code   baseline/our_code/roadNet-CA/roadNet-CA_eigenvector_scores.csv \\
-        --csr-scalar baseline/csr_scalar/roadNet-CA/roadNet-CA_eigenvector_scores.csv \\
-        --cusparse   baseline/cu_sparse/roadNet-CA/roadNet-CA_eigenvector_scores.csv \\
-        --lanczos    baseline/lanczos/roadNet-CA/roadNet-CA_eigenvector_scores.csv
+        --networkx    baseline/networkx/roadNet-CA/roadNet-CA_eigenvector_scores.csv \\
+        --our-code    baseline/our_code/roadNet-CA/roadNet-CA_eigenvector_scores.csv \\
+        --csr-scalar  baseline/csr_scalar/roadNet-CA/roadNet-CA_eigenvector_scores.csv \\
+        --cusparse    baseline/cu_sparse/roadNet-CA/roadNet-CA_eigenvector_scores.csv \\
+        --lanczos     baseline/lanczos/roadNet-CA/roadNet-CA_eigenvector_scores.csv \\
+        --merge-path  baseline/eigen_centrality/roadNet-CA/roadNet-CA_eigenvector_scores.csv
         """,
     )
     parser.add_argument("--networkx", required=True,
@@ -300,6 +302,8 @@ Example:
                         help="Path to cuSPARSE + cuBLAS scores CSV")
     parser.add_argument("--lanczos", required=True,
                         help="Path to Lanczos scores CSV")
+    parser.add_argument("--merge-path", required=True,
+                        help="Path to Merge-Path FP32 scores CSV")
     parser.add_argument("--top-k", type=int, default=20,
                         help="Number of top nodes to compare (default: 20)")
     args = parser.parse_args()
@@ -315,6 +319,7 @@ Example:
         "CSR-scalar + cuBLAS":      args.csr_scalar,
         "cuSPARSE + cuBLAS":        args.cusparse,
         "Lanczos":                  args.lanczos,
+        "Merge-Path FP32":          args.merge_path,
     }
 
     ref_df = load_scores(args.networkx)
@@ -367,8 +372,4 @@ Example:
 
 
 if __name__ == "__main__":
-<<<<<<< HEAD
     main()
-=======
-    main()
->>>>>>> c3bb1d1205107ff7c711690c31e52b9f8bd2d457
