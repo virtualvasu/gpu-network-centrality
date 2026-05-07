@@ -77,30 +77,6 @@ struct CudaTimer {
     }
 };
 
-// ---------------------------------------------------------------------------
-// CSR-scalar SpMV kernel
-//
-// One thread per row i:
-//   y[i] = sum_{j = row_ptr[i]}^{row_ptr[i+1]-1}  vals[j] * x[col_idx[j]]
-//
-// Each thread:
-//   1. Reads row_ptr[i] and row_ptr[i+1]  (2 int loads)
-//   2. Loops over the row's non-zeros      (nnz_i iterations)
-//   3. Each iteration: 1 int load (col_idx) + 1 float load (vals)
-//                    + 1 gather load (x[col]) + 1 FMA
-//   4. Writes one float (y[i])
-//
-// Performance characteristic:
-//   - Irregular memory access pattern on x[] (random gather).
-//   - Threads in the same warp handle different rows and thus
-//     access entirely different columns => no coalescing on x.
-//   - vals[] and col_idx[] ARE accessed sequentially within a row,
-//     but adjacent threads in a warp start at different offsets
-//     => partial coalescing only for regular (equal-degree) graphs.
-//   - Works well when all rows have similar length (regular graphs).
-//   - Degrades on power-law graphs where a few rows are very long
-//     (those threads become the bottleneck; others sit idle).
-// ---------------------------------------------------------------------------
 __global__ void csr_scalar_spmv(
     const int64_t *__restrict__ row_ptr, // [n+1]
     const int   *__restrict__ col_idx,   // [nnz]
@@ -124,8 +100,6 @@ __global__ void csr_scalar_spmv(
 
 // ---------------------------------------------------------------------------
 // L2-normalise kernel  (in-place, called after cuBLAS nrm2)
-//
-// Avoids a separate cublasSscal call — saves one kernel launch.
 // ---------------------------------------------------------------------------
 __global__ void normalize_inplace(float *v, float inv_norm, int n)
 {
@@ -512,7 +486,7 @@ static void run_evcent_scalar(
 }
 
 // ---------------------------------------------------------------------------
-// Degree statistics (host-side, for the summary)
+// Degree statistics
 // ---------------------------------------------------------------------------
 static void degree_stats(const CsrGraph &g,
                          double &avg, int &mx, int &mn)

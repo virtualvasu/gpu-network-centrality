@@ -367,4 +367,8 @@ Example:
 
 
 if __name__ == "__main__":
+<<<<<<< HEAD
     main()
+=======
+    main()
+>>>>>>> c3bb1d1205107ff7c711690c31e52b9f8bd2d457
