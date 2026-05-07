@@ -27,10 +27,7 @@
     }                                                                          \
   } while (0)
 
-// =============================================================================
-// Robust Binary Loader — supports both 32-bit and 64-bit nnz formats
-// (ported from our_code.cu for compatibility with all dataset sizes)
-// =============================================================================
+
 struct CsrGraphHost {
   int n = 0;
   int nnz = 0;
@@ -154,9 +151,7 @@ static bool load_csr_binary_compat(const char *path, CsrGraphHost &g) {
   return true;
 }
 
-// =============================================================================
-// Output path helpers
-// =============================================================================
+
 struct OutputPaths {
   std::string dataset_key, output_dir, scores_csv, metrics_json;
 };
@@ -199,10 +194,6 @@ static OutputPaths build_paths(const char *input_path) {
   p.metrics_json = p.output_dir + "/step0_metrics.json";
   return p;
 }
-
-// =============================================================================
-// KERNELS
-// =============================================================================
 
 // 1. Parallel Reduction — computes norm² of y and sum of diff[] in one pass.
 //    Two shared memory arrays avoid a second kernel launch.
@@ -318,9 +309,7 @@ __global__ void normalize_residual_kernel(int n, float *__restrict__ x,
   }
 }
 
-// =============================================================================
-// Main solver
-// =============================================================================
+
 void run_optimized_evcent(const char *path, int max_iter, float tol,
                           int top_k) {
   OutputPaths out = build_paths(path);
@@ -377,16 +366,16 @@ void run_optimized_evcent(const char *path, int max_iter, float tol,
       cudaMemcpy(d_x, h_x.data(), n * sizeof(float), cudaMemcpyHostToDevice));
   cudaEventRecord(ev_h2d_1);
 
-  // --- Dynamic block counts (replaces hardcoded 168) ---
+ 
   const int num_threads = 256;
   const size_t shared_mem = 2 * num_threads * sizeof(float);
-  // SpMV: enough blocks to cover n+nnz work items
+
   const int num_blocks_spmv =
       std::max(1, std::min(4096, (n + nnz + num_threads - 1) / num_threads));
-  // Reduce: enough blocks to cover n elements (grid-stride handles the rest)
+
   const int num_blocks_reduce =
       std::max(1, std::min(4096, (n + num_threads - 1) / num_threads));
-  // Normalize: exact coverage of n elements
+ 
   const int num_blocks_norm = (n + num_threads - 1) / num_threads;
 
   int iter = 0;
@@ -399,7 +388,7 @@ void run_optimized_evcent(const char *path, int max_iter, float tol,
 
   while (iter < max_iter && h_residual > tol) {
 
-    // Step 1: SpMV  d_y = A * d_x
+    // Step 1: SpMV 
     CUDA_CHECK(cudaMemset(d_y, 0, n * sizeof(float)));
     cudaEventRecord(ev_spmv_0);
     hybrid_spmv_merge_path_kernel_v2<<<num_blocks_spmv, num_threads>>>(
