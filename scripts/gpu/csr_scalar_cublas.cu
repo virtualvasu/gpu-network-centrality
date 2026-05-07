@@ -248,6 +248,7 @@ struct EvcMetrics {
     double gflops;             // SpMV GFLOP/s
     double gbps;               // SpMV effective bandwidth (GB/s)
     double bw_util_pct;
+    size_t memory_footprint_bytes;
     int    iters;
     double final_residual;
 };
@@ -333,6 +334,7 @@ static bool write_metrics_json(const std::string &path, const OutputPaths &out,
                                int max_iter, float tol, int top_k,
                                const EvcMetrics &m, double density,
                                double peak_bw, double bw_util,
+                               double reconstruction_error_l2,
                                int top_node_id, double top_score)
 {
     FILE *f = fopen(path.c_str(), "w");
@@ -351,9 +353,15 @@ static bool write_metrics_json(const std::string &path, const OutputPaths &out,
     fprintf(f, "  \"tol\": %.12g,\n", tol);
     fprintf(f, "  \"top_k\": %d,\n", top_k);
     fprintf(f, "  \"runtime_seconds\": %.12g,\n", m.total_gpu_ms / 1e3);
+    fprintf(f, "  \"execution_time_seconds\": %.12g,\n", m.total_gpu_ms / 1e3);
+    fprintf(f, "  \"execution_time_ms\": %.12g,\n", m.total_gpu_ms);
+    fprintf(f, "  \"mteps\": %.12g,\n", (m.iters > 0 && m.total_gpu_ms > 0.0)
+                                         ? (static_cast<double>(g.nnz) * static_cast<double>(m.iters) / (m.total_gpu_ms / 1e3) / 1e6)
+                                         : 0.0);
     fprintf(f, "  \"iterations\": %d,\n", m.iters);
     fprintf(f, "  \"converged\": %s,\n", (m.final_residual <= tol) ? "true" : "false");
     fprintf(f, "  \"final_residual\": %.12g,\n", m.final_residual);
+    fprintf(f, "  \"reconstruction_error_l2\": %.12g,\n", reconstruction_error_l2);
     fprintf(f, "  \"h2d_ms\": %.12g,\n", m.h2d_ms);
     fprintf(f, "  \"d2h_ms\": %.12g,\n", m.d2h_ms);
     fprintf(f, "  \"spmv_ms\": %.12g,\n", m.total_spmv_ms);
@@ -363,8 +371,16 @@ static bool write_metrics_json(const std::string &path, const OutputPaths &out,
     fprintf(f, "  \"effective_bandwidth_gbps\": %.12g,\n", m.gbps);
     fprintf(f, "  \"peak_bandwidth_gbps\": %.12g,\n", peak_bw);
     fprintf(f, "  \"bw_util_percent\": %.12g,\n", bw_util);
+    fprintf(f, "  \"memory_footprint_bytes\": %zu,\n", m.memory_footprint_bytes);
+    fprintf(f, "  \"memory_footprint_gb\": %.12g,\n", static_cast<double>(m.memory_footprint_bytes) / 1e9);
+    fprintf(f, "  \"global_memory_load_transactions\": null,\n");
+    fprintf(f, "  \"l2_cache_hit_rate_percent\": null,\n");
+    fprintf(f, "  \"unified_cache_hit_rate_percent\": null,\n");
     fprintf(f, "  \"top_node_id\": %d,\n", top_node_id);
-    fprintf(f, "  \"top_score\": %.12g\n", top_score);
+    fprintf(f, "  \"top_score\": %.12g,\n", top_score);
+    fprintf(f, "  \"vector_orthogonality_deg_avg\": null,\n");
+    fprintf(f, "  \"precision_mode\": \"float32\",\n");
+    fprintf(f, "  \"precision_tradeoff_note\": \"single_precision_only\"\n");
     fprintf(f, "}\n");
 
     fclose(f);
@@ -459,6 +475,11 @@ static void run_evcent_scalar(
     m.avg_iter_ms   = iter > 0 ? (total_spmv_ms + total_norm_ms) / iter : 0.0;
     m.iters         = iter;
     m.final_residual = (double)residual;
+    m.memory_footprint_bytes =
+        static_cast<size_t>(n + 1) * sizeof(int64_t) +
+        static_cast<size_t>(nnz) * sizeof(int) +
+        static_cast<size_t>(nnz) * sizeof(float) +
+        static_cast<size_t>(n) * sizeof(float) * 3;
 
     // -- Performance metrics --
     // SpMV: 2 FLOPs per non-zero (multiply + add)
@@ -593,6 +614,28 @@ int main(int argc, char **argv)
     std::sort(sorted_idx.begin(), sorted_idx.end(),
               [&](int a, int b){ return scores[a] > scores[b]; });
 
+    double reconstruction_error_l2 = 0.0;
+    if (!scores.empty()) {
+        double x_norm_sq = 0.0;
+        double lambda_num = 0.0;
+        std::vector<float> ax(g.n, 0.0f);
+        for (int row = 0; row < g.n; ++row) {
+            double sum = 0.0;
+            for (int64_t jj = g.row_ptr[row]; jj < g.row_ptr[row + 1]; ++jj) {
+                sum += static_cast<double>(g.vals[jj]) * static_cast<double>(scores[g.col_idx[jj]]);
+            }
+            ax[row] = static_cast<float>(sum);
+            x_norm_sq += static_cast<double>(scores[row]) * static_cast<double>(scores[row]);
+            lambda_num += static_cast<double>(scores[row]) * sum;
+        }
+        const double lambda_est = (x_norm_sq > 0.0) ? (lambda_num / x_norm_sq) : 0.0;
+        for (int row = 0; row < g.n; ++row) {
+            const double diff = static_cast<double>(ax[row]) - lambda_est * static_cast<double>(scores[row]);
+            reconstruction_error_l2 += diff * diff;
+        }
+        reconstruction_error_l2 = std::sqrt(reconstruction_error_l2);
+    }
+
     if (!write_scores_csv(out.scores_csv, sorted_idx, scores)) {
         fprintf(stderr, "Failed to write scores CSV: %s\n", out.scores_csv.c_str());
         return EXIT_FAILURE;
@@ -600,7 +643,8 @@ int main(int argc, char **argv)
 
     double density = g.n > 0 ? (double)g.nnz / ((double)g.n * (double)g.n) : 0.0;
     if (!write_metrics_json(out.metrics_json, out, bin_path, g, max_iter, tol, top_k,
-                            m, density, peak_bw, m.bw_util_pct, idx[0], scores[idx[0]])) {
+                            m, density, peak_bw, m.bw_util_pct, reconstruction_error_l2,
+                            idx[0], scores[idx[0]])) {
         fprintf(stderr, "Failed to write metrics JSON: %s\n", out.metrics_json.c_str());
         return EXIT_FAILURE;
     }

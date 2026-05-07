@@ -92,6 +92,20 @@ def load_binary_csr(path: Path):
     return indptr, indices, data, num_nodes, num_edges
 
 
+def compute_reconstruction_error_l2(A: csr_matrix, centrality: Dict[int, float], num_nodes: int) -> float:
+    x = np.zeros(num_nodes, dtype=np.float64)
+    for node_id, score in centrality.items():
+        x[int(node_id)] = float(score)
+
+    x_norm_sq = float(np.dot(x, x))
+    if x_norm_sq == 0.0:
+        return 0.0
+
+    ax = A.dot(x)
+    lambda_est = float(np.dot(x, ax) / x_norm_sq)
+    return float(np.linalg.norm(ax - lambda_est * x))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run NetworkX eigenvector baseline from existing binary CSR.")
     parser.add_argument(
@@ -180,8 +194,32 @@ def main() -> None:
         "graph_type": "undirected",
         "max_iter": int(MAX_ITER),
         "tol": float(TOL),
+        "top_k": int(TOP_K),
         "runtime_seconds": float(runtime_seconds),
+        "execution_time_seconds": float(runtime_seconds),
+        "execution_time_ms": float(runtime_seconds * 1000.0),
+        "mteps": None,
+        "iterations": None,
         "converged": bool(converged),
+        "final_residual": None,
+        "reconstruction_error_l2": compute_reconstruction_error_l2(A, centrality, num_nodes),
+        "h2d_ms": None,
+        "d2h_ms": None,
+        "spmv_ms": None,
+        "normalize_ms": None,
+        "avg_iter_ms": None,
+        "effective_gflops": None,
+        "effective_bandwidth_gbps": None,
+        "peak_bandwidth_gbps": None,
+        "bw_util_percent": None,
+        "memory_footprint_bytes": None,
+        "memory_footprint_gb": None,
+        "global_memory_load_transactions": None,
+        "l2_cache_hit_rate_percent": None,
+        "unified_cache_hit_rate_percent": None,
+        "vector_orthogonality_deg_avg": None,
+        "precision_mode": "float64",
+        "precision_tradeoff_note": "cpu_double_precision_no_mixed_precision_curve",
         "top_score": float(scores_df.iloc[0]["score"]),
         "top_node_id": int(scores_df.iloc[0]["node_id"]),
         "score_sum": float(scores_df["score"].sum()),

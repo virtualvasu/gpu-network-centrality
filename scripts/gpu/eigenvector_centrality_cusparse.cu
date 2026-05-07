@@ -199,12 +199,15 @@ static bool load_csr_binary(const char *path, CsrGraph &g)
 struct EvcMetrics {
     double load_ms;
     double h2d_ms;
+    double d2h_ms;
     double total_gpu_ms;
-    double total_iter_ms;
+    double total_spmv_ms;
+    double total_norm_ms;
     double avg_iter_ms;
     double gflops;
     double gbps;
-    double d2h_ms;
+    double bw_util_pct;
+    size_t memory_footprint_bytes;
     int    iters;
     double final_residual;
 };
@@ -306,6 +309,7 @@ static bool write_metrics_json(const std::string &path, const OutputPaths &out,
                                int max_iter, float tol, int top_k,
                                const EvcMetrics &m, double density,
                                double peak_bw, double bw_util,
+                               double reconstruction_error_l2,
                                int top_node_id, double top_score)
 {
     FILE *f = fopen(path.c_str(), "w");
@@ -324,19 +328,34 @@ static bool write_metrics_json(const std::string &path, const OutputPaths &out,
     fprintf(f, "  \"tol\": %.12g,\n", tol);
     fprintf(f, "  \"top_k\": %d,\n", top_k);
     fprintf(f, "  \"runtime_seconds\": %.12g,\n", m.total_gpu_ms / 1e3);
+    fprintf(f, "  \"execution_time_seconds\": %.12g,\n", m.total_gpu_ms / 1e3);
+    fprintf(f, "  \"execution_time_ms\": %.12g,\n", m.total_gpu_ms);
+    fprintf(f, "  \"mteps\": %.12g,\n", (m.iters > 0 && m.total_gpu_ms > 0.0)
+                                         ? (static_cast<double>(g.nnz) * static_cast<double>(m.iters) / (m.total_gpu_ms / 1e3) / 1e6)
+                                         : 0.0);
     fprintf(f, "  \"iterations\": %d,\n", m.iters);
     fprintf(f, "  \"converged\": %s,\n", (m.final_residual <= tol) ? "true" : "false");
     fprintf(f, "  \"final_residual\": %.12g,\n", m.final_residual);
+    fprintf(f, "  \"reconstruction_error_l2\": %.12g,\n", reconstruction_error_l2);
     fprintf(f, "  \"h2d_ms\": %.12g,\n", m.h2d_ms);
     fprintf(f, "  \"d2h_ms\": %.12g,\n", m.d2h_ms);
-    fprintf(f, "  \"spmv_normalize_ms\": %.12g,\n", m.total_iter_ms);
+    fprintf(f, "  \"spmv_ms\": %.12g,\n", m.total_spmv_ms);
+    fprintf(f, "  \"normalize_ms\": %.12g,\n", m.total_norm_ms);
     fprintf(f, "  \"avg_iter_ms\": %.12g,\n", m.avg_iter_ms);
     fprintf(f, "  \"effective_gflops\": %.12g,\n", m.gflops);
     fprintf(f, "  \"effective_bandwidth_gbps\": %.12g,\n", m.gbps);
     fprintf(f, "  \"peak_bandwidth_gbps\": %.12g,\n", peak_bw);
     fprintf(f, "  \"bw_util_percent\": %.12g,\n", bw_util);
+    fprintf(f, "  \"memory_footprint_bytes\": %zu,\n", m.memory_footprint_bytes);
+    fprintf(f, "  \"memory_footprint_gb\": %.12g,\n", static_cast<double>(m.memory_footprint_bytes) / 1e9);
+    fprintf(f, "  \"global_memory_load_transactions\": null,\n");
+    fprintf(f, "  \"l2_cache_hit_rate_percent\": null,\n");
+    fprintf(f, "  \"unified_cache_hit_rate_percent\": null,\n");
     fprintf(f, "  \"top_node_id\": %d,\n", top_node_id);
-    fprintf(f, "  \"top_score\": %.12g\n", top_score);
+    fprintf(f, "  \"top_score\": %.12g,\n", top_score);
+    fprintf(f, "  \"vector_orthogonality_deg_avg\": null,\n");
+    fprintf(f, "  \"precision_mode\": \"float32\",\n");
+    fprintf(f, "  \"precision_tradeoff_note\": \"single_precision_only\"\n");
     fprintf(f, "}\n");
 
     fclose(f);
@@ -425,9 +444,16 @@ static void run_evcent(
     void *d_buf = nullptr;
     if (buf_size) CUDA_CHECK(cudaMalloc(&d_buf, buf_size));
 
+    m.memory_footprint_bytes =
+        static_cast<size_t>(n + 1) * sizeof(int) +
+        static_cast<size_t>(nnz) * sizeof(int) +
+        static_cast<size_t>(nnz) * sizeof(float) +
+        static_cast<size_t>(n) * sizeof(float) * 3 +
+        buf_size;
+
     // Power iteration
-    CudaTimer total_timer, iter_timer;
-    double total_iter_ms = 0.0;
+    CudaTimer total_timer, spmv_timer, norm_timer;
+    double total_spmv_ms = 0.0, total_norm_ms = 0.0;
     int    iter          = 0;
     float  residual      = 1e9f;
 
@@ -435,20 +461,20 @@ static void run_evcent(
 
     for (iter = 0; iter < max_iter && residual > tol; ++iter) {
 
-        iter_timer.begin();
-
+        spmv_timer.begin();
         CUSPARSE_CHECK(cusparseSpMV(
             sp, CUSPARSE_OPERATION_NON_TRANSPOSE,
             &alpha, matA, vec_v, &beta, vec_v_new,
             CUDA_R_32F, CUSPARSE_SPMV_ALG_DEFAULT, d_buf));
+        total_spmv_ms += spmv_timer.end();
 
+        norm_timer.begin();
         float norm = 1.0f;
         CUBLAS_CHECK(cublasSnrm2(bl, n, d_v_new, 1, &norm));
         if (norm < 1e-12f) norm = 1.0f;
         float inv = 1.0f / norm;
         CUBLAS_CHECK(cublasSscal(bl, n, &inv, d_v_new, 1));
-
-        total_iter_ms += iter_timer.end();
+        total_norm_ms += norm_timer.end();
 
         // residual = ||v_new - v||
         CUDA_CHECK(cudaMemcpy(d_diff, d_v_new, n * sizeof(float), cudaMemcpyDeviceToDevice));
@@ -462,16 +488,15 @@ static void run_evcent(
     }
 
     m.total_gpu_ms   = total_timer.end();
-    m.total_iter_ms  = total_iter_ms;
-    m.avg_iter_ms    = iter > 0 ? total_iter_ms / iter : 0.0;
+    m.total_spmv_ms  = total_spmv_ms;
+    m.total_norm_ms  = total_norm_ms;
+    m.avg_iter_ms    = iter > 0 ? (total_spmv_ms + total_norm_ms) / iter : 0.0;
     m.iters          = iter;
     m.final_residual = (double)residual;
 
-    double flops = 2.0 * nnz * iter;
-    m.gflops = flops / (total_iter_ms * 1e-3) / 1e9;
-
-    double bytes = 4.0 * (2.0 * nnz + (n + 1) + 2.0 * n) * iter;
-    m.gbps = bytes / (total_iter_ms * 1e-3) / 1e9;
+    m.gflops = 2.0 * static_cast<double>(nnz) * iter / (total_spmv_ms * 1e-3) / 1e9;
+    double bytes_per_iter = 8.0 * (n + 1) + 4.0 * (3.0 * static_cast<double>(nnz) + n);
+    m.gbps = bytes_per_iter * iter / (total_spmv_ms * 1e-3) / 1e9;
 
     // D2H
     h_scores.resize(n);
@@ -552,6 +577,28 @@ int main(int argc, char **argv)
     m.load_ms = load_ms;
     run_evcent(g, max_iter, tol, scores, m);
 
+    double reconstruction_error_l2 = 0.0;
+    if (!scores.empty()) {
+        double x_norm_sq = 0.0;
+        double lambda_num = 0.0;
+        std::vector<float> ax(g.n, 0.0f);
+        for (int row = 0; row < g.n; ++row) {
+            double sum = 0.0;
+            for (int jj = g.row_ptr[row]; jj < g.row_ptr[row + 1]; ++jj) {
+                sum += static_cast<double>(g.vals[jj]) * static_cast<double>(scores[g.col_idx[jj]]);
+            }
+            ax[row] = static_cast<float>(sum);
+            x_norm_sq += static_cast<double>(scores[row]) * static_cast<double>(scores[row]);
+            lambda_num += static_cast<double>(scores[row]) * sum;
+        }
+        const double lambda_est = (x_norm_sq > 0.0) ? (lambda_num / x_norm_sq) : 0.0;
+        for (int row = 0; row < g.n; ++row) {
+            const double diff = static_cast<double>(ax[row]) - lambda_est * static_cast<double>(scores[row]);
+            reconstruction_error_l2 += diff * diff;
+        }
+        reconstruction_error_l2 = std::sqrt(reconstruction_error_l2);
+    }
+
     // Top-k
     top_k = std::min(top_k, g.n);
     std::vector<int> idx(g.n);
@@ -583,10 +630,12 @@ int main(int argc, char **argv)
     // Metrics
     double csr_mb  = (8.0 * (g.n + 1) + 4.0 * g.nnz + 4.0 * g.nnz) / 1e6;
     double bw_util = peak_bw > 0 ? m.gbps / peak_bw * 100.0 : 0.0;
+    m.bw_util_pct = bw_util;
     double density = g.n > 0 ? (double)g.nnz / ((double)g.n * (double)g.n) : 0.0;
 
     if (!write_metrics_json(out.metrics_json, out, bin_path, g, max_iter, tol, top_k,
-                            m, density, peak_bw, bw_util, idx[0], scores[idx[0]])) {
+                            m, density, peak_bw, bw_util, reconstruction_error_l2,
+                            idx[0], scores[idx[0]])) {
         fprintf(stderr, "Failed to write metrics JSON: %s\n", out.metrics_json.c_str());
         return EXIT_FAILURE;
     }
@@ -596,7 +645,8 @@ int main(int argc, char **argv)
     printf("  %-32s : %8.2f ms\n",       "H2D transfer",           m.h2d_ms);
     printf("  %-32s : %8.2f ms\n",       "D2H transfer",           m.d2h_ms);
     printf("  %-32s : %8.2f ms\n",       "Total GPU time",         m.total_gpu_ms);
-    printf("  %-32s : %8.2f ms\n",       "SpMV+normalize only",    m.total_iter_ms);
+    printf("  %-32s : %8.2f ms\n",       "SpMV time",              m.total_spmv_ms);
+    printf("  %-32s : %8.2f ms\n",       "Normalize time",         m.total_norm_ms);
     printf("  %-32s : %8d\n",             "Iterations",             m.iters);
     printf("  %-32s : %8.4f ms\n",       "Avg time / iteration",   m.avg_iter_ms);
     printf("  %-32s : %8.3f GFLOP/s\n",  "Effective GFLOP/s",      m.gflops);
