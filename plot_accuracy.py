@@ -7,11 +7,12 @@ accuracy across all GPU implementations vs the NetworkX CPU baseline.
 
 Usage (same arguments as compare_accuracy.py):
     python3 plot_accuracy.py \
-        --networkx   baseline/networkx/roadNet-CA/roadNet-CA_eigenvector_scores.csv \
-        --our-code   baseline/our_code/roadNet-CA/roadNet-CA_eigenvector_scores.csv \
-        --csr-scalar baseline/csr_scalar/roadNet-CA/roadNet-CA_eigenvector_scores.csv \
-        --cusparse   baseline/cu_sparse/roadNet-CA/roadNet-CA_eigenvector_scores.csv \
-        --lanczos    baseline/lanczos/roadNet-CA/roadNet-CA_eigenvector_scores.csv \
+        --networkx    baseline/networkx/roadNet-CA/roadNet-CA_eigenvector_scores.csv \
+        --our-code    baseline/our_code/roadNet-CA/roadNet-CA_eigenvector_scores.csv \
+        --csr-scalar  baseline/csr_scalar/roadNet-CA/roadNet-CA_eigenvector_scores.csv \
+        --cusparse    baseline/cu_sparse/roadNet-CA/roadNet-CA_eigenvector_scores.csv \
+        --lanczos     baseline/lanczos/roadNet-CA/roadNet-CA_eigenvector_scores.csv \
+        --merge-path  baseline/eigen_centrality/roadNet-CA/roadNet-CA_eigenvector_scores.csv \
         [--top-k 20] [--out-dir accuracy_plots]
 """
 
@@ -32,6 +33,7 @@ COLORS = {
     "CSR-scalar + cuBLAS": "#f72585",
     "cuSPARSE + cuBLAS":   "#7209b7",
     "Lanczos":             "#06d6a0",
+    "Merge-Path FP32":     "#e63946",
 }
 REF_COLOR = "#ff9f1c"
 
@@ -80,7 +82,9 @@ def cos_sim(a, b):
 
 def plot_score_comparison(ref_nodes, ref_scores, impl_data, k, out_dir):
     """Bar chart: reference vs each implementation scores side by side."""
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    n_impl = len(impl_data)
+    nrows = (n_impl + 1) // 2
+    fig, axes = plt.subplots(nrows, 2, figsize=(16, 6 * nrows))
     axes = axes.ravel()
     x = np.arange(k)
 
@@ -95,6 +99,10 @@ def plot_score_comparison(ref_nodes, ref_scores, impl_data, k, out_dir):
         ax.set_xticklabels([str(i+1) for i in x], fontsize=8)
         ax.legend(fontsize=9)
         ax.ticklabel_format(axis='y', style='sci', scilimits=(-3, 3))
+
+    # Hide unused subplot(s)
+    for i in range(n_impl, len(axes)):
+        axes[i].set_visible(False)
 
     fig.suptitle(f"Top-{k} Eigenvector Centrality Scores: GPU vs NetworkX", fontsize=15, fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.96])
@@ -165,7 +173,7 @@ def plot_summary_heatmap(ref_nodes, ref_scores, impl_data, k, out_dir):
         data[i, 3] = max(0, 1 - mae * 1e3)
         data[i, 4] = max(0, 1 - rmse * 1e3)
 
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(11, 6))
     im = ax.imshow(data, cmap="RdYlGn", aspect="auto", vmin=0, vmax=1)
 
     ax.set_xticks(range(len(metrics_labels)))
@@ -232,7 +240,7 @@ def plot_node_match_matrix(ref_nodes, impl_data, k, out_dir):
         for j in range(k):
             matrix[i, j] = 1.0 if nodes[j] == ref_nodes[j] else 0.0
 
-    fig, ax = plt.subplots(figsize=(14, 4))
+    fig, ax = plt.subplots(figsize=(14, 5))
     im = ax.imshow(matrix, cmap="RdYlGn", aspect="auto", vmin=0, vmax=1, interpolation="nearest")
 
     ax.set_xticks(range(k))
@@ -295,8 +303,8 @@ def plot_summary_bars(ref_nodes, ref_scores, impl_data, k, out_dir):
 
     metric_names = list(list(metrics.values())[0].keys())
     x = np.arange(len(metric_names))
-    width = 0.18
-    offsets = np.linspace(-width*1.5, width*1.5, len(names))
+    width = 0.14
+    offsets = np.linspace(-width*2, width*2, len(names))
 
     fig, ax = plt.subplots(figsize=(10, 6))
     for i, name in enumerate(names):
@@ -328,6 +336,8 @@ def main():
     parser.add_argument("--csr-scalar", required=True)
     parser.add_argument("--cusparse", required=True)
     parser.add_argument("--lanczos", required=True)
+    parser.add_argument("--merge-path", required=True,
+                        help="Path to Merge-Path scores CSV")
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--out-dir", type=str, default="accuracy_plots",
                         help="Directory to save plots (default: accuracy_plots)")
@@ -346,6 +356,7 @@ def main():
         "CSR-scalar + cuBLAS": args.csr_scalar,
         "cuSPARSE + cuBLAS":   args.cusparse,
         "Lanczos":             args.lanczos,
+        "Merge-Path FP32":     args.merge_path,
     }
 
     impl_data = {}
